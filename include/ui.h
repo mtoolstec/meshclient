@@ -37,7 +37,7 @@ class MeshtasticClient;
 // About Us text definition
 #define ABOUT_TEXT "MeshClient by MTools Tec. Provides BLE and UART connectivity for Meshtastic nodes."
 
-#define BUILD_VERSION "1.0.0"
+#define BUILD_VERSION "1.0.1"
 
 #define BUILD_DATE __DATE__
 
@@ -367,6 +367,7 @@ private:
     // Manual BLE scan state (for 5s scan from Messages menu)
     bool manualBleScanActive = false;
     uint32_t manualBleScanStartTime = 0;
+    bool hasUsableConnection() const;
 };
 
 extern MeshtasticUI *g_ui;

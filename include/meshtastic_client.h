@@ -171,6 +171,7 @@ public:
     bool isTextMessageMode() const { return messageMode == MODE_TEXTMSG; }
     MessageMode getMessageMode() const { return messageMode; }
     String getMessageModeString() const;
+    bool hasActiveTransport() const;
     
     // User connection preference management
     void setUserConnectionPreference(int preference) { 

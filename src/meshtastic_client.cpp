@@ -1282,8 +1282,8 @@ void MeshtasticClient::drainIncoming(bool quick, bool fromNotify) {
         
         for (const auto &channel : parsed.channels) { 
             updateChannel(channel); 
-            Serial.printf("[Config] Channel %d: name='%s' role=%d (current: %d, primary: '%s')\n", 
-                         channel.index, channel.name.c_str(), channel.role, currentChannel, primaryChannelName.c_str());
+            // Serial.printf("[Config] Channel %d: name='%s' role=%d (current: %d, primary: '%s')\n", 
+            //              channel.index, channel.name.c_str(), channel.role, currentChannel, primaryChannelName.c_str());
         }
 
         for (const auto &ack : parsed.acks) { updateMessageStatus(ack.packetId, MSG_STATUS_DELIVERED); }
@@ -1638,7 +1638,7 @@ bool MeshtasticClient::sendMessage(uint32_t nodeId, const String &message, uint8
         }
     }
     
-    if (!isDeviceConnected()) {
+    if (!hasActiveTransport()) {
         Serial.println("[SendMsg] Not connected - aborting");
         return false;
     }
@@ -2847,6 +2847,33 @@ void MeshtasticClient::updateConnectionState(ConnectionState newState) {
 
 bool MeshtasticClient::isInitializationComplete() const {
     return connectionState == CONN_READY;
+}
+
+bool MeshtasticClient::hasActiveTransport() const {
+    if (isConnected) {
+        return true;
+    }
+
+    switch (connectionState) {
+        case CONN_CONNECTED:
+        case CONN_REQUESTING_CONFIG:
+        case CONN_WAITING_CONFIG:
+        case CONN_NODE_DISCOVERY:
+        case CONN_READY:
+            return true;
+        default:
+            break;
+    }
+
+    if (uartAvailable) {
+        return true;
+    }
+
+    if (bleClient && bleClient->isConnected() && toRadioChar) {
+        return true;
+    }
+
+    return false;
 }
 
 void MeshtasticClient::handleConfigTimeout() {

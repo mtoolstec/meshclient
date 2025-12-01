@@ -927,8 +927,11 @@ void MeshtasticUI::drawHeader() {
 	// Draw connection text based on user preference, not actual connection
 	bool showBluetoothText = (currentConnectionType == CONNECTION_BLUETOOTH);
 	bool showGroveText = (currentConnectionType == CONNECTION_GROVE);
-	bool isConnected = (client && client->isDeviceConnected());
-	bool isReady = (client && client->getConnectionState() == CONN_READY);
+	bool bleTransportReady = client && client->getConnectionType() == "BLE" && client->hasActiveTransport();
+	bool uartTransportReady = client && (
+		client->isUARTAvailable() ||
+		(client->getConnectionType() == "UART" && client->hasActiveTransport())
+	);
 	
 	// Draw connection type text (white when connected, brighter grey when not connected, no border)
 	if (showBluetoothText) {
@@ -937,8 +940,8 @@ void MeshtasticUI::drawHeader() {
 		int bleTextWidth = M5.Lcd.textWidth("BLE");
 		int centeredX = connectionTextX + (connectionTextWidth - bleTextWidth) / 2;
 		
-		// Set color based on connection status (white when connected, brighter grey when not)
-		M5.Lcd.setTextColor(isReady ? WHITE : GREY);
+		// Set color based on live transport availability (white when connected, brighter grey when not)
+		M5.Lcd.setTextColor(bleTransportReady ? WHITE : GREY);
 		
 		// Draw "BLE" text centered vertically with same calculation as header text
 		M5.Lcd.drawString("BLE", centeredX, textCenterY);
@@ -951,8 +954,8 @@ void MeshtasticUI::drawHeader() {
 		int uartTextWidth = M5.Lcd.textWidth("UART");
 		int centeredX = connectionTextX + (connectionTextWidth - uartTextWidth) / 2;
 		
-		// Set color based on connection status (white when connected, brighter grey when not)
-		M5.Lcd.setTextColor(isReady ? WHITE : GREY);
+		// Set color based on live transport availability (white when connected, brighter grey when not)
+		M5.Lcd.setTextColor(uartTransportReady ? WHITE : GREY);
 		
 		// Draw "UART" text centered vertically with same calculation as header text
 		M5.Lcd.drawString("UART", centeredX, textCenterY);
@@ -2397,18 +2400,8 @@ void MeshtasticUI::openMessageActionMenu() {
 		return;
 	}
 	
-	// Check if device is connected based on current UI connection type
-	bool effectivelyConnected = false;
-	if (client) {
-		if (currentConnectionType == CONNECTION_BLUETOOTH) {
-			// 在蓝牙模式下，明确要求当前连接类型为 BLE 才算已连接
-			effectivelyConnected = (client->isDeviceConnected() && client->getConnectionType() == "BLE");
-		} else {
-			// 在 Grove 模式，任一连接可视为已连接
-			effectivelyConnected = client->isDeviceConnected();
-		}
-	}
-	
+	bool effectivelyConnected = hasUsableConnection();
+
 	if (!effectivelyConnected) {
 		// Filter connection menu based on current connection type
 		modalType = 1;
@@ -4345,17 +4338,7 @@ void MeshtasticUI::showMessagesForDestination() {
 		// Show instruction when no messages for current destination
 		M5.Lcd.setTextColor(WHITE);
 		
-		// Check device connection status based on current UI connection type
-		bool effectivelyConnected = false;
-		if (client) {
-			if (currentConnectionType == CONNECTION_BLUETOOTH) {
-				// In Bluetooth mode, require BLE connection specifically
-				effectivelyConnected = (client->isDeviceConnected() && client->getConnectionType() == "BLE");
-			} else {
-				// In Grove mode, any connection is fine
-				effectivelyConnected = client->isDeviceConnected();
-			}
-		}
+		bool effectivelyConnected = hasUsableConnection();
 		
 		if (!effectivelyConnected) {
 			drawText("Device not connected", BORDER_PAD, y + 20);
@@ -4685,6 +4668,10 @@ void MeshtasticUI::attemptAutoConnection() {
 		}
 		// 让启动序列负责在 2s 后显示提示并开始扫描，5s 后展示结果
 	}
+}
+
+bool MeshtasticUI::hasUsableConnection() const {
+	return client && client->hasActiveTransport();
 }
 
 // ========== BLE PIN Dialog Methods ==========
