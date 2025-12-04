@@ -3,6 +3,7 @@
 
 #include "globals.h"
 #include "meshtastic_protocol.h"
+#include "meshcore_protocol.h"
 #include <NimBLEAdvertisedDevice.h>
 #include <NimBLEClient.h>
 #include <NimBLEDevice.h>
@@ -72,6 +73,11 @@ enum ConnectionState {
     CONN_ERROR = 8
 };
 
+enum DeviceType {
+    DEVICE_MESHTASTIC = 0,
+    DEVICE_MESHCORE = 1
+};
+
 struct MeshtasticMessage {
     uint32_t fromNodeId = 0;
     uint32_t toNodeId = 0;
@@ -136,6 +142,7 @@ public:
     
     // Grove/UART connection control
     bool startGroveConnection();   // Start Grove/UART connection attempt (manual trigger)
+    void setUARTConfig(uint32_t baud, int txPin, int rxPin, bool enable = true);
 
     bool sendMessage(uint32_t nodeId, const String &message, uint8_t channel = 0);
     bool sendTextMessage(const String &message, uint32_t nodeId);
@@ -143,8 +150,14 @@ public:
     bool broadcastMessage(const String &message, uint8_t channel = 0);
     bool sendTraceRoute(uint32_t nodeId, uint8_t hopLimit = 5);
     void handleTraceRouteResponse(uint32_t targetNodeId, const std::vector<uint32_t>& route, const std::vector<float>& snrValues);
+    
+    // MeshCore specific
+    // Moved to MeshCore send methods section
 
     void refreshNodeList();
+    void requestNodeList();
+    void requestConfig();
+    void disconnectBLE();
     void showMessageHistory();
     void clearMessageHistory(); // Clear all messages from history
     String formatLastHeard(uint32_t seconds);
@@ -153,12 +166,14 @@ public:
     bool isDeviceConnected() const { return isConnected; }
     String getConnectionStatus() const;
     ConnectionState getConnectionState() const { return connectionState; }
+    void updateConnectionState(int state); // Made public for inline usage
     const std::vector<MeshtasticNode> &getNodeList() const { return nodeList; }
     const std::vector<MeshtasticMessage> &getMessageHistory() const { return messageHistory; }
     int getMessageCountForDestination(uint32_t nodeId) const;
     String getPrimaryChannelName() const { return primaryChannelName; }
     uint32_t getMyNodeId() const { return myNodeId; }
     String getConnectionType() const { return connectionType; }
+    DeviceType getDeviceType() const { return deviceType; }
     uint8_t getCurrentChannel() const { return currentChannel; }
     const std::vector<String> &getLastScanDevices() const { return lastScanDevicesNames; }
     uint32_t getUARTBaud() const { return uartBaud; }
@@ -170,9 +185,48 @@ public:
     bool isUARTAvailable() const { return uartAvailable; }
     bool isTextMessageMode() const { return messageMode == MODE_TEXTMSG; }
     MessageMode getMessageMode() const { return messageMode; }
+    void setTextMessageMode(int mode);
+    void setMessageMode(int mode);
     String getMessageModeString() const;
     bool hasActiveTransport() const;
     
+    // Screen & UI helpers
+    bool isScreenTimedOut() const;
+    void wakeScreen();
+    int getBrightness() const;
+    void setBrightness(uint8_t brightness);
+    uint32_t getScreenTimeout() const;
+    String getScreenTimeoutString() const;
+    void setScreenTimeout(uint32_t timeout);
+
+    // Pairing & Auth
+    void showPinDialog(uint32_t passkey);
+    void handleRemoteDisconnect();
+    
+    // Public members for UI/Callbacks access
+    bool waitingForPinInput = false;
+    NimBLEClient* bleClient = nullptr;
+    uint32_t pinInputStartTime = 0;
+    bool pairingInProgress = false;
+    bool pairingComplete = false;
+    bool pairingSuccessful = false;
+    uint16_t pendingPairingConnHandle = 0;
+    
+    // UI State members
+    uint8_t brightness = 128;
+    uint32_t lastScreenActivity = 0;
+
+    // Scanning members
+    bool bleUiScanActive = false;
+    std::vector<String> scannedDeviceAddresses;
+    std::vector<String> scannedDeviceNames;
+    std::vector<bool> scannedDevicePaired;
+    std::vector<uint8_t> scannedDeviceAddrTypes;
+    bool bleAutoConnectRequested = false;
+    String bleAutoConnectTargetAddress;
+    NimBLEScan* activeScan = nullptr;
+    MeshtasticBLEScanCallbacks* scanCallback = nullptr;
+
     // User connection preference management
     void setUserConnectionPreference(int preference) { 
         userConnectionPreference = (UserConnectionPreference)preference;
@@ -208,95 +262,23 @@ public:
         }
     }
 
-    void onFromNumNotify(uint8_t *data, size_t length);
-    void drainIncoming(bool quick = false, bool fromNotify = false);
-    void handleRemoteDisconnect();
-
-    // BLE scanning state (public for UI access)
-    bool bleUiScanActive = false;
-    std::vector<String> scannedDeviceNames;
-    std::vector<String> scannedDeviceAddresses;
-    std::vector<bool> scannedDevicePaired;
-    // Address types discovered during scan; values are BLE_ADDR_PUBLIC / BLE_ADDR_RANDOM
-    std::vector<uint8_t> scannedDeviceAddrTypes;
-    NimBLEScan* activeScan = nullptr;
-    MeshtasticBLEScanCallbacks* scanCallback = nullptr;
-    // Pairing state flags - used by client callbacks to inform the connection flow
-    // Made public so MeshtasticBLEClientCallback implementations can update them.
-    volatile bool pairingInProgress = false;
-    volatile bool pairingComplete = false;
-    volatile bool pairingSuccessful = false;
+    void onFromNumNotify(NimBLERemoteCharacteristic *pBLERemoteCharacteristic, uint8_t *pData, size_t length, bool isNotify);
+    void onFromNumNotify(uint8_t *pData, size_t length); // Overload for direct call
     
-    // PIN input state (for non-blocking PIN entry)
-    volatile bool waitingForPinInput = false;
-    uint32_t pinInputStartTime = 0;
-    uint16_t pendingPairingConnHandle = 0;
+    // MeshCore notification handler
+    void onMeshCoreNotify(uint8_t *data, size_t length);
     
-    // Subscription retry state (for non-blocking pairing)
-    bool needsSubscriptionRetry = false;
-    uint32_t subscriptionRetryStartTime = 0;
-    int subscriptionRetryCount = 0;
+    // MeshCore send methods
+    bool sendMeshCoreText(const String& text, const std::vector<uint8_t>& pubKeyPrefix);
+    bool sendMeshCoreBroadcast(const String& text, uint8_t channelIdx = 0);
+    void sendMeshCorePing(const std::vector<uint8_t>& pubKey);
+    void sendMeshCorePing(uint32_t nodeId); // Overload for convenience
+    void sendMeshCoreGetContacts(); // Request contact list
+    void handleMeshCoreContactMessage(uint8_t code, const uint8_t *data, size_t length);
+    void handleMeshCoreChannelMessage(uint8_t code, const uint8_t *data, size_t length);
+    const MeshtasticNode* findNodeByPubKeyPrefix(const uint8_t *prefix, size_t len) const;
+    uint32_t deriveNodeIdFromPrefix(const uint8_t *prefix, size_t len) const;
 
-    // Lightweight notify signal from BLE callback; drained in main loop
-    volatile bool fromNumNotifyPending = false;
-    
-    // BLE client (public for PIN injection in main loop)
-    NimBLEClient *bleClient = nullptr;
-    
-    // Auto-connect state
-    bool bleAutoConnectRequested = false;
-    String bleAutoConnectTargetAddress;
-    void setUARTConfig(uint32_t baud, int txPin, int rxPin, bool force = false);
-    void setTextMessageMode(bool enabled);
-    void setMessageMode(MessageMode mode);
-    void setBrightness(uint8_t brightness);
-    uint8_t getBrightness() const { return displayBrightness; }
-
-    // Screen timeout management
-    void setScreenTimeout(uint32_t timeoutMs);
-    uint32_t getScreenTimeout() const { return screenTimeoutMs; }
-    String getScreenTimeoutString() const;
-    bool isScreenTimedOut() const;
-    void wakeScreen();
-    void updateScreenTimeout();
-
-    // BLE Authentication helpers
-    void showPinDialog(uint32_t passkey);
-    
-    // Node management
-    void requestNodeList();
-
-    // Configuration management
-    void requestConfig();
-
-    // Persistent settings
-    void loadSettings();
-    void saveSettings();
-
-private:
-    // Async connect internals
-    static void AsyncConnectTask(void* param);
-    struct AsyncConnectParams { MeshtasticClient* self; String name; String address; };
-    bool asyncConnectInProgress = false;
-    TaskHandle_t asyncConnectTaskHandle = nullptr;
-
-    // Unified BLE connection method - supports device object, address, or name
-    bool connectToBLE(const NimBLEAdvertisedDevice *device = nullptr, const String &addressOrName = "");
-    bool tryInitUART();
-    bool probeUARTOnce();
-    std::vector<uint8_t> receiveProtobufUART();
-    bool sendProtobufUART(const uint8_t *data, size_t len, bool allowWhenUnavailable = false);
-    void processTextMessage();
-    bool sendTextUART(const String &message, uint32_t nodeId = 0xFFFFFFFF);
-
-    void disconnectBLE();
-    bool sendProtobuf(const uint8_t *data, size_t length, bool preferResponse = true);
-    std::vector<uint8_t> receiveProtobuf();
-    void updateConnectionState(ConnectionState newState);
-    bool isInitializationComplete() const;
-    void handleConfigTimeout();
-    String getConnectionStateString() const;
-    void addMessageToHistory(const MeshtasticMessage &msg);
     void updateMessageStatus(uint32_t packetId, MessageStatus newStatus);
     void upsertNode(const ParsedNodeInfo &parsed);
     void updateChannel(const ParsedChannelInfo &parsed);
@@ -320,6 +302,12 @@ private:
     NimBLERemoteCharacteristic *fromRadioChar = nullptr;
     NimBLERemoteCharacteristic *toRadioChar = nullptr;
     NimBLERemoteCharacteristic *fromNumChar = nullptr;
+
+    // MeshCore BLE Characteristics
+    NimBLERemoteCharacteristic *meshCoreRxChar = nullptr; // Write
+    NimBLERemoteCharacteristic *meshCoreTxChar = nullptr; // Notify
+
+    DeviceType deviceType = DEVICE_MESHTASTIC;
 
     std::vector<MeshtasticNode> nodeList;
     std::vector<MeshtasticMessage> messageHistory;
@@ -385,6 +373,38 @@ private:
     bool uartDeferredConfig = false;
     uint32_t uartDeferredStartTime = 0;
     
+    // Internal state for subscription retries
+    bool needsSubscriptionRetry = false;
+    uint32_t subscriptionRetryStartTime = 0;
+    uint32_t subscriptionRetryCount = 0;
+    bool fromNumNotifyPending = false;
+    
+    // Async connect state
+    bool asyncConnectInProgress = false;
+    TaskHandle_t asyncConnectTaskHandle = nullptr;
+
+    struct AsyncConnectParams {
+        MeshtasticClient* self;
+        String name;
+        String address;
+    };
+
+    // Private helper methods
+    void loadSettings();
+    void saveSettings();
+    void addMessageToHistory(const MeshtasticMessage &msg);
+    void updateScreenTimeout();
+    void handleConfigTimeout();
+    bool tryInitUART();
+    bool probeUARTOnce();
+    void drainIncoming(bool processAll, bool fastMode);
+    void processTextMessage();
+    bool connectToBLE(const NimBLEAdvertisedDevice *device, const String &addressOrName = "");
+    static void AsyncConnectTask(void *param);
+    bool sendProtobuf(const uint8_t *data, size_t length, bool preferResponse = false);
+    std::vector<uint8_t> receiveProtobuf();
+    std::vector<uint8_t> receiveProtobufUART();
+    bool sendProtobufUART(const uint8_t *data, size_t len, bool allowWhenUnavailable);
 
 };
 

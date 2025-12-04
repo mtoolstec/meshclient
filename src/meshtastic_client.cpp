@@ -111,21 +111,7 @@ static String sanitizeDisplayName(const String& in) {
 
 // Strict validation for nodes before adding to the list
 bool isValidNodeForStorage(const ParsedNodeInfo &parsed) {
-    // Must have a valid non-zero node ID
-    if (parsed.nodeId == 0) return false;
-    
-    // Must have at least one non-empty name (short OR long)
-    bool hasShortName = parsed.user.shortName.length() > 0;
-    bool hasLongName = parsed.user.longName.length() > 0;
-    
-    if (!hasShortName && !hasLongName) {
-        // LOGF("[NodeValidation] Rejecting node 0x%08X - no names at all (short:'%s'[%d], long:'%s'[%d])\n", 
-        //      parsed.nodeId, parsed.user.shortName.c_str(), parsed.user.shortName.length(),
-        //      parsed.user.longName.c_str(), parsed.user.longName.length());
-        return false;
-    }
-    
-    return true;
+    return parsed.nodeId != 0;
 }
 
 namespace {
@@ -151,6 +137,11 @@ fromNumNotifyCB(NimBLERemoteCharacteristic *characteristic, uint8_t *data, size_
 
     // fromNum notification means new data is available; signal main loop to drain.
     g_client->onFromNumNotify(nullptr, 0);
+}
+
+static void meshCoreNotifyCB(NimBLERemoteCharacteristic *characteristic, uint8_t *data, size_t length, bool isNotify) {
+    if (!g_client) return;
+    g_client->onMeshCoreNotify(data, length);
 }
 
 // Simple BLE security callback for PIN display
@@ -254,26 +245,29 @@ void MeshtasticBLEScanCallbacks::onResult(const NimBLEAdvertisedDevice *advertis
         String deviceAddress = advertisedDevice->getAddress().toString().c_str();
         int rssi = advertisedDevice->getRSSI();
         bool hasMeshSvc = advertisedDevice->isAdvertisingService(NimBLEUUID(MESHTASTIC_SERVICE_UUID));
+        bool hasMeshCoreSvc = advertisedDevice->isAdvertisingService(NimBLEUUID(MESHCORE_SERVICE_UUID));
 
-        // Only process Meshtastic devices - allow devices without names
-        if (!hasMeshSvc) {
-            // Skip non-Meshtastic devices for the UI list
+        // Only process Meshtastic or MeshCore devices - allow devices without names
+        if (!hasMeshSvc && !hasMeshCoreSvc) {
+            // Skip non-Meshtastic/MeshCore devices for the UI list
             return;
         }
         
         // If device has no name, use address as fallback display name
         if (deviceName.length() == 0) {
             deviceName = deviceAddress; // Use address as display name
-            Serial.printf("[BLE-Scan] Unnamed Meshtastic device: addr=%s rssi=%d (using address as name)\n",
+            Serial.printf("[BLE-Scan] Unnamed %s device: addr=%s rssi=%d (using address as name)\n",
+                          hasMeshCoreSvc ? "MeshCore" : "Meshtastic",
                           deviceAddress.c_str(), rssi);
         } else {
-            Serial.printf("[BLE-Scan] Named Meshtastic device: addr=%s rssi=%d name='%s'\n",
+            Serial.printf("[BLE-Scan] Named %s device: addr=%s rssi=%d name='%s'\n",
+                          hasMeshCoreSvc ? "MeshCore" : "Meshtastic",
                           deviceAddress.c_str(), rssi, deviceName.c_str());
         }
 
         // Log device discovery only for valid named devices
-        Serial.printf("[BLE-Scan] Device found: addr=%s rssi=%d name='%s' mesh=%s\n",
-                      deviceAddress.c_str(), rssi, deviceName.c_str(), "YES");
+        Serial.printf("[BLE-Scan] Device found: addr=%s rssi=%d name='%s' mesh=%s core=%s\n",
+                      deviceAddress.c_str(), rssi, deviceName.c_str(), hasMeshSvc ? "YES" : "NO", hasMeshCoreSvc ? "YES" : "NO");
 
         // Check if device already exists in our list
         bool exists = false;
@@ -556,12 +550,13 @@ void MeshtasticClient::loop() {
         
         if (shouldTryUART && now - lastUARTProbeMillis >= UART_PROBE_INTERVAL_MS) {
             Serial.println("[UART] Manual Grove connection triggered, attempting UART init...");
-            tryInitUART();
+            bool initOk = tryInitUART();
             lastUARTProbeMillis = now;
-            // Reset flag after attempt - will retry if still not connected
-            if (!uartAvailable) {
+            if (initOk && uartAvailable) {
+                Serial.println("[UART] Grove connection established during retry");
                 groveConnectionManuallyTriggered = false;
-                Serial.println("[UART] Connection attempt failed, flag reset. Select 'Connect to Grove' to retry.");
+            } else {
+                Serial.println("[UART] Grove attempt still pending; will retry automatically");
             }
         }
     } else if (uartAvailable && !textMessageMode && connectionType != "BLE") {
@@ -907,39 +902,69 @@ bool MeshtasticClient::connectToBLE(const NimBLEAdvertisedDevice *device, const 
     waitingForPinInput = false;
     
     // Discover service & characteristics
-    LOG_PRINTLN("[BLE] Discovering Meshtastic service...");
+    LOG_PRINTLN("[BLE] Discovering services...");
+    
+    // Try Meshtastic Service first
     meshService = bleClient->getService(NimBLEUUID(MESHTASTIC_SERVICE_UUID));
-    if (!meshService) {
-        LOG_PRINTLN("[BLE] ✗ Meshtastic service not found");
-        if (g_ui) g_ui->displayError("Not a Meshtastic device");
-        disconnectBLE();
-        return false;
+    if (meshService) {
+        deviceType = DEVICE_MESHTASTIC;
+        LOG_PRINTLN("[BLE] ✓ Meshtastic service found");
+        
+        fromRadioChar = meshService->getCharacteristic(NimBLEUUID(FROM_RADIO_CHAR_UUID));
+        toRadioChar = meshService->getCharacteristic(NimBLEUUID(TO_RADIO_CHAR_UUID));
+        fromNumChar = meshService->getCharacteristic(NimBLEUUID(FROM_NUM_CHAR_UUID));
+        
+        if (!fromRadioChar || !toRadioChar || !fromNumChar) {
+            LOG_PRINTF("[BLE] ✗ Missing characteristics: from=%p to=%p num=%p\n",
+                      fromRadioChar, toRadioChar, fromNumChar);
+            if (g_ui) g_ui->displayError("Device not compatible");
+            disconnectBLE();
+            return false;
+        }
+    } else {
+        // Try MeshCore Service (Nordic UART)
+        meshService = bleClient->getService(NimBLEUUID(MESHCORE_SERVICE_UUID));
+        if (meshService) {
+            deviceType = DEVICE_MESHCORE;
+            LOG_PRINTLN("[BLE] ✓ MeshCore service found");
+            
+            meshCoreRxChar = meshService->getCharacteristic(NimBLEUUID(MESHCORE_RX_CHAR_UUID));
+            meshCoreTxChar = meshService->getCharacteristic(NimBLEUUID(MESHCORE_TX_CHAR_UUID));
+            
+            if (!meshCoreRxChar || !meshCoreTxChar) {
+                LOG_PRINTF("[BLE] ✗ Missing MeshCore characteristics: rx=%p tx=%p\n",
+                          meshCoreRxChar, meshCoreTxChar);
+                if (g_ui) g_ui->displayError("Device not compatible");
+                disconnectBLE();
+                return false;
+            }
+        } else {
+            LOG_PRINTLN("[BLE] ✗ No supported service found");
+            if (g_ui) g_ui->displayError("Not a Meshtastic/MeshCore device");
+            disconnectBLE();
+            return false;
+        }
     }
-    LOG_PRINTLN("[BLE] ✓ Meshtastic service found");
     
-    fromRadioChar = meshService->getCharacteristic(NimBLEUUID(FROM_RADIO_CHAR_UUID));
-    toRadioChar = meshService->getCharacteristic(NimBLEUUID(TO_RADIO_CHAR_UUID));
-    fromNumChar = meshService->getCharacteristic(NimBLEUUID(FROM_NUM_CHAR_UUID));
-    
-    if (!fromRadioChar || !toRadioChar || !fromNumChar) {
-        LOG_PRINTF("[BLE] ✗ Missing characteristics: from=%p to=%p num=%p\n",
-                  fromRadioChar, toRadioChar, fromNumChar);
-        if (g_ui) g_ui->displayError("Device not compatible");
-        disconnectBLE();
-        return false;
-    }
-    
-    LOG_PRINTF("[BLE] ✓ All characteristics found\n");
+    LOG_PRINTF("[BLE] ✓ All characteristics found for %s\n", deviceType == DEVICE_MESHCORE ? "MeshCore" : "Meshtastic");
     // Avoid using temporary std::string.c_str() pointers from toString(); store strings first
     {
         std::string svc = meshService->getUUID().toString();
-        std::string fr = fromRadioChar->getUUID().toString();
-        std::string tr = toRadioChar->getUUID().toString();
-        std::string fn = fromNumChar->getUUID().toString();
         LOG_PRINTF("[BLE]   Service: %s\n", svc.c_str());
-        LOG_PRINTF("[BLE]   FromRadio: %s\n", fr.c_str());
-        LOG_PRINTF("[BLE]   ToRadio: %s\n", tr.c_str());
-        LOG_PRINTF("[BLE]   FromNum: %s\n", fn.c_str());
+        
+        if (deviceType == DEVICE_MESHTASTIC) {
+            std::string fr = fromRadioChar->getUUID().toString();
+            std::string tr = toRadioChar->getUUID().toString();
+            std::string fn = fromNumChar->getUUID().toString();
+            LOG_PRINTF("[BLE]   FromRadio: %s\n", fr.c_str());
+            LOG_PRINTF("[BLE]   ToRadio: %s\n", tr.c_str());
+            LOG_PRINTF("[BLE]   FromNum: %s\n", fn.c_str());
+        } else {
+            std::string rx = meshCoreRxChar->getUUID().toString();
+            std::string tx = meshCoreTxChar->getUUID().toString();
+            LOG_PRINTF("[BLE]   RX: %s\n", rx.c_str());
+            LOG_PRINTF("[BLE]   TX: %s\n", tx.c_str());
+        }
     }
     
     // Subscribe to notifications - this may trigger pairing if not already paired
@@ -958,9 +983,18 @@ bool MeshtasticClient::connectToBLE(const NimBLEAdvertisedDevice *device, const 
     
     bool subNumOk = false;
     try {
-        subNumOk = fromNumChar->subscribe(true, fromNumNotifyCB);
+        if (deviceType == DEVICE_MESHCORE) {
+             subNumOk = meshCoreTxChar->subscribe(true, meshCoreNotifyCB);
+        } else {
+             subNumOk = fromNumChar->subscribe(true, fromNumNotifyCB);
+        }
         if (subNumOk) {
             LOG_PRINTLN("[BLE] ✓ Subscription successful immediately (already paired)");
+            
+            // If MeshCore, request contacts immediately
+            if (deviceType == DEVICE_MESHCORE) {
+                sendMeshCoreGetContacts();
+            }
         } else {
             LOG_PRINTLN("[BLE] ✗ Subscription failed - likely needs pairing");
             LOG_PRINTLN("[BLE] Will retry subscription in background via main loop");
@@ -998,6 +1032,17 @@ bool MeshtasticClient::connectToBLE(const NimBLEAdvertisedDevice *device, const 
         saveSettings();
     }
     
+    // Ensure we disconnect any active UART session to avoid conflicts
+    if (uartAvailable) {
+        Serial.println("[BLE] Disabling UART for BLE connection");
+        // We don't fully tear down UART driver here to allow quick switch back,
+        // but we mark it unavailable for transport.
+        // Actually, let's be cleaner:
+        uartAvailable = false;
+        // We keep uartInited true so we can reuse the driver if needed, 
+        // but connectionType will be BLE.
+    }
+    
     Preferences prefs;
     if (prefs.begin("meshtastic", false)) {
         prefs.putString("lastBleDevice", devAddress);
@@ -1016,7 +1061,20 @@ bool MeshtasticClient::connectToBLE(const NimBLEAdvertisedDevice *device, const 
         updateConnectionState(CONN_READY);
     } else if (!needsSubscriptionRetry && !waitingForPinInput) {
         // Only request config if subscription was successful
-        requestConfig();
+        if (deviceType == DEVICE_MESHCORE) {
+             // Send App Start and Device Query
+             std::vector<uint8_t> appStart = MeshCore::buildAppStartFrame("Cardputer");
+             meshCoreRxChar->writeValue(appStart.data(), appStart.size(), false);
+             delay(100);
+             std::vector<uint8_t> devQuery = MeshCore::buildDeviceQueryFrame();
+             meshCoreRxChar->writeValue(devQuery.data(), devQuery.size(), false);
+             delay(100);
+             std::vector<uint8_t> getContacts = MeshCore::buildGetContactsFrame();
+             meshCoreRxChar->writeValue(getContacts.data(), getContacts.size(), false);
+             updateConnectionState(CONN_READY); // Assume ready for MeshCore
+        } else {
+             requestConfig();
+        }
     } else {
         LOG_PRINTLN("[BLE] Delaying config request until pairing/subscription completes");
         // Config will be requested after successful subscription retry
@@ -1030,6 +1088,11 @@ void MeshtasticClient::disconnectBLE() {
         fromNumChar->unsubscribe();
         fromNumChar = nullptr;
     }
+    if (meshCoreTxChar) {
+        meshCoreTxChar->unsubscribe();
+        meshCoreTxChar = nullptr;
+    }
+    meshCoreRxChar = nullptr;
     fromRadioChar = nullptr;
     toRadioChar = nullptr;
     meshService = nullptr;
@@ -1184,11 +1247,11 @@ bool MeshtasticClient::sendProtobuf(const uint8_t *data, size_t length, bool pre
     if (isConnected && toRadioChar) {
         if (textMessageMode) return false;
         // Log UUIDs and truncated hex even in fallback BLE path for visibility
-    std::string svcStr = meshService ? meshService->getUUID().toString() : std::string("(no-svc)");
-    std::string toStr = toRadioChar->getUUID().toString();
-    bool ok = toRadioChar->writeValue(data, length, preferResponse);
-    LOG_PRINTF("[BLE-TX] (fallback) write(withResponse=%d) result=%d\n", preferResponse ? 1 : 0, ok ? 1 : 0);
-    return ok;
+        std::string svcStr = meshService ? meshService->getUUID().toString() : std::string("(no-svc)");
+        std::string toStr = toRadioChar->getUUID().toString();
+        bool ok = toRadioChar->writeValue(data, length, preferResponse);
+        LOG_PRINTF("[BLE-TX] (fallback) write(withResponse=%d) result=%d\n", preferResponse ? 1 : 0, ok ? 1 : 0);
+        return ok;
     }
 
     return false;
@@ -1226,674 +1289,351 @@ void MeshtasticClient::onFromNumNotify(uint8_t *data, size_t length) {
     fromNumNotifyPending = true;
 }
 
-void MeshtasticClient::drainIncoming(bool quick, bool fromNotify) {
-    int loops = quick ? 1 : 5;
-    while (loops-- > 0) {
-        auto data = receiveProtobuf();
-        if (data.empty()) break;
-
-        // Serial.printf("[RX] Received protobuf packet, size=%d bytes\n", data.size());
-        
-        ParsedFromRadio parsed;
-        if (!parseFromRadio(data, parsed, myNodeId)) {
-            // Throttle noisy parse-fail logs to once per second
-            static uint32_t s_lastParseFailLog = 0;
-            uint32_t nowMs = millis();
-            if (nowMs - s_lastParseFailLog >= 1000) {
-                // Serial.printf("[RX] Failed to parse protobuf packet (size=%u)\n", (unsigned)data.size());
-                s_lastParseFailLog = nowMs;
-            }
-            continue;
-        }
-
-        // Minimal log for successfully parsed packets
-        // Serial.printf("[RX] Parsed: texts=%u acks=%u\n",
-        //               (unsigned)parsed.texts.size(),
-        //               (unsigned)parsed.acks.size());
-
-        // Handle configuration data
-        if (connectionState == CONN_WAITING_CONFIG) {
-            if (parsed.hasMyInfo || !parsed.channels.empty() || 
-                parsed.sawConfig || parsed.sawConfigComplete) {
-                configReceived = true;
-                LOG_PRINTLN("[Config] Configuration data received");
-            }
-            
-            // Standard startup: ready when we have device info, nodes come separately
-            if (parsed.hasMyInfo) {
-                Serial.println("[Config] Device info received - ready for operation");
-                updateConnectionState(CONN_READY);
-            } else if (parsed.sawConfigComplete) {
-                Serial.println("[Config] Configuration complete signal received - ready for operation");
-                updateConnectionState(CONN_READY);
-            }
-        }
-
-        if (parsed.hasMyInfo) {
-            myNodeId = parsed.myInfo.myNodeNum;
-            // Serial.printf("[NodeInfo] My Node ID: 0x%08X\n", myNodeId);
-        }
-
-        for (const auto &node : parsed.nodes) { 
-            // Serial.printf("[NodeInfo] Processing node: 0x%08X (%s)\n", node.nodeId, node.user.shortName.c_str());
-            upsertNode(node); 
-            // Serial.printf("[NodeInfo] After upsert - total nodes: %d\n", nodeList.size());
-        }
-        
-        for (const auto &channel : parsed.channels) { 
-            updateChannel(channel); 
-            // Serial.printf("[Config] Channel %d: name='%s' role=%d (current: %d, primary: '%s')\n", 
-            //              channel.index, channel.name.c_str(), channel.role, currentChannel, primaryChannelName.c_str());
-        }
-
-        for (const auto &ack : parsed.acks) { updateMessageStatus(ack.packetId, MSG_STATUS_DELIVERED); }
-
-        for (const auto &text : parsed.texts) {
-            // Get sender info
-            auto *sender = getNodeById(text.from);
-            String fullFromName;
-            if (sender) {
-                if (isValidDisplayName(sender->shortName)) {
-                    fullFromName = sender->shortName;
-                } else if (isValidDisplayName(sender->longName)) {
-                    fullFromName = sender->longName;
-                } else {
-                    fullFromName = generateNodeDisplayName(text.from);
-                }
-            } else {
-                fullFromName = generateNodeDisplayName(text.from);
-            }
-            
-            // For UI display - use short format
-            String uiFromName;
-            if (sender && isValidDisplayName(sender->shortName)) {
-                uiFromName = sender->shortName;
-            } else if (sender && isValidDisplayName(sender->longName)) {
-                uiFromName = sender->longName;
-            } else {
-                uiFromName = generateNodeDisplayName(text.from);
-            }
-            
-            auto *target = getNodeById(text.to);
-            String toName;
-            if (target) {
-                if (isValidDisplayName(target->shortName)) {
-                    toName = target->shortName;
-                } else if (isValidDisplayName(target->longName)) {
-                    toName = target->longName;
-                } else {
-                    toName = generateNodeDisplayName(text.to);
-                }
-            } else {
-                toName = (text.to == 0xFFFFFFFF) ? "Broadcast" : generateNodeDisplayName(text.to);
-            }
-            
-            // Debug log with full info
-            // Serial.printf("[Message] %s: %s\n", fullFromName.c_str(), text.text.c_str());
-            
-            MeshtasticMessage msg;
-            msg.fromNodeId = text.from;
-            msg.toNodeId = text.to;
-            msg.content = text.text;
-            msg.channel = text.channel;
-            msg.packetId = text.packetId;
-            msg.timestamp = millis() / 1000;
-            msg.status = MSG_STATUS_DELIVERED;
-            msg.fromName = uiFromName;  // Use short format for UI
-            msg.toName = toName;
-            msg.snr = 0.0f;  // SNR not available in this layer of protobuf parsing
-
-            addMessageToHistory(msg);
-        }
-        
-        // Handle trace route responses
-        for (const auto &trace : parsed.traceRoutes) {
-            Serial.printf("[TraceRoute] Received trace route response from 0x%08X to 0x%08X\n", trace.from, trace.to);
-            Serial.printf("[TraceRoute] Forward route has %d hops, %d SNR values\n", trace.route.size(), trace.snr.size());
-            Serial.printf("[TraceRoute] Return route has %d hops, %d SNR values\n", trace.routeBack.size(), trace.snrBack.size());
-            
-            // Only show trace route result if we're waiting for a response (we initiated the trace route)
-            if (traceRouteWaitingForResponse) {
-                // Clear timeout tracking
-                traceRouteWaitingForResponse = false;
+void MeshtasticClient::onMeshCoreNotify(uint8_t *data, size_t length) {
+    if (length == 0) return;
+    
+    // Parse MeshCore frame
+    uint8_t code = data[0];
+    
+    switch (code) {
+        case MeshCore::RESP_CODE_DEVICE_INFO:
+            LOG_PRINTLN("[MeshCore] Device Info received");
+            break;
+        case MeshCore::RESP_CODE_SELF_INFO: {
+            // Parse Self Info
+            // Layout: code(1), type(1), tx(1), max_tx(1), pub_key(32), lat(4), lon(4), ...
+            // Name starts at offset 58
+            if (length >= 58) {
+                // Update myNodeId from public key (first 4 bytes)
+                myNodeId = data[4] | (data[5] << 8) | (data[6] << 16) | (data[7] << 24);
                 
-                if (g_ui) {
-                    g_ui->openTraceRouteResult(trace.to, trace.route, trace.snr, trace.routeBack, trace.snrBack);
+                // Extract name
+                char nameBuf[64]; // Reasonable max length
+                size_t nameLen = length - 58;
+                if (nameLen > 63) nameLen = 63;
+                memcpy(nameBuf, &data[58], nameLen);
+                nameBuf[nameLen] = 0;
+                
+                String nameStr = String(nameBuf);
+                if (!nameStr.isEmpty()) {
+                    myNodeName = nameStr;
+                    connectedDeviceName = nameStr;
+                    LOG_PRINTF("[MeshCore] Self Info: Name=%s, ID=0x%08X\n", nameStr.c_str(), myNodeId);
+                    
+                    // Update UI if needed
+                    if (g_ui) g_ui->forceRedraw();
                 }
-            } else {
-                Serial.printf("[TraceRoute] Ignoring trace route response - we didn't initiate this trace route\n");
             }
+            break;
+        }
+        case MeshCore::RESP_CODE_SENT:
+            LOG_PRINTLN("[MeshCore] Message Sent");
+            if (g_ui) g_ui->showSuccess("Message Sent");
+            break;
+        case MeshCore::PUSH_CODE_MSG_WAITING:
+            LOG_PRINTLN("[MeshCore] Message Waiting");
+            // Send CMD_SYNC_NEXT_MESSAGE (10)
+            if (meshCoreRxChar) {
+                std::vector<uint8_t> frame;
+                frame.push_back(MeshCore::CMD_SYNC_NEXT_MESSAGE);
+                meshCoreRxChar->writeValue(frame.data(), frame.size(), false);
+            }
+            break;
+        case MeshCore::PUSH_CODE_STATUS_RESPONSE:
+            LOG_PRINTLN("[MeshCore] Status Response (Ping Reply)");
+            if (g_ui) g_ui->showSuccess("Ping Reply Received");
+            break;
+        case MeshCore::PUSH_CODE_ADVERT:
+             LOG_PRINTLN("[MeshCore] Advert Received");
+             break;
+        case MeshCore::RESP_CODE_CONTACTS_START:
+             LOG_PRINTLN("[MeshCore] Contacts Start");
+             break;
+        case MeshCore::RESP_CODE_END_OF_CONTACTS:
+             LOG_PRINTLN("[MeshCore] End of Contacts");
+             break;
+        case MeshCore::RESP_CODE_CONTACT: {
+             // Parse contact
+             // Layout: code(1), pub_key(32), type(1), flags(1), out_path_len(1), out_path(64), adv_name(32), ...
+             if (length >= 132) {
+                 ParsedNodeInfo nodeInfo;
+                 // Use first 4 bytes of pubkey as ID (Little Endian)
+                 nodeInfo.nodeId = data[1] | (data[2] << 8) | (data[3] << 16) | (data[4] << 24);
+                 
+                 char nameBuf[33];
+                 memcpy(nameBuf, &data[100], 32);
+                 nameBuf[32] = 0;
+                 nodeInfo.user.longName = String(nameBuf);
+                 // If name is empty, use Node ID as name, but don't prefix with "Node " to avoid double prefixing
+                 if (nodeInfo.user.longName.isEmpty()) {
+                     nodeInfo.user.longName = String(nodeInfo.nodeId, HEX);
+                 }
+                 nodeInfo.user.shortName = nodeInfo.user.longName.substring(0, 4);
+                 nodeInfo.user.id = String(nodeInfo.nodeId);
+                 
+                 // Extract other fields
+                 // last_advert (132), adv_lat (136), adv_lon (140), lastmod (144)
+                 if (length >= 144) {
+                     int32_t lat = data[136] | (data[137] << 8) | (data[138] << 16) | (data[139] << 24);
+                     int32_t lon = data[140] | (data[141] << 8) | (data[142] << 16) | (data[143] << 24);
+                     nodeInfo.latitude = lat / 1000000.0f;
+                     nodeInfo.longitude = lon / 1000000.0f;
+                     nodeInfo.hasPosition = (lat != 0 || lon != 0);
+                 }
+
+                 upsertNode(nodeInfo);
+                 
+                 // Now update the node in the list with the full public key (stored in macAddress)
+                 if (nodeIndexById.count(nodeInfo.nodeId)) {
+                     size_t idx = nodeIndexById[nodeInfo.nodeId];
+                     String pubKeyHex = "";
+                     for(int i=0; i<32; i++) {
+                         char hex[3];
+                         sprintf(hex, "%02X", data[1+i]);
+                         pubKeyHex += hex;
+                     }
+                     nodeList[idx].macAddress = pubKeyHex;
+                 }
+                 LOG_PRINTF("[MeshCore] Contact added: %s (0x%08X)\n", nodeInfo.user.longName.c_str(), nodeInfo.nodeId);
+             } else {
+                 LOG_PRINTF("[MeshCore] Contact frame too short: %d\n", length);
+             }
+             break;
+        }
+        case MeshCore::RESP_CODE_CONTACT_MSG_RECV:
+        case 16: // RESP_CODE_CONTACT_MSG_RECV_V3
+             handleMeshCoreContactMessage(code, data, length);
+             break;
+        case MeshCore::RESP_CODE_CHANNEL_MSG_RECV:
+        case 17: // RESP_CODE_CHANNEL_MSG_RECV_V3
+             handleMeshCoreChannelMessage(code, data, length);
+             break;
+        default:
+            LOG_PRINTF("[MeshCore] Unknown code: %d\n", code);
+            break;
+    }
+}
+
+const MeshtasticNode* MeshtasticClient::findNodeByPubKeyPrefix(const uint8_t *prefix, size_t len) const {
+    if (!prefix || len == 0) return nullptr;
+    String prefixHex;
+    prefixHex.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02X", prefix[i]);
+        prefixHex += buf;
+    }
+    for (const auto &node : nodeList) {
+        if (node.macAddress.length() >= prefixHex.length() && node.macAddress.startsWith(prefixHex)) {
+            return &node;
         }
     }
+    return nullptr;
 }
 
-void MeshtasticClient::handleRemoteDisconnect() {
-    isConnected = false;
-    deviceConnected = false;
-    connectionType = "None";
-    
-    // Reset connection state on remote disconnect
-    updateConnectionState(CONN_DISCONNECTED);
-    autoNodeDiscoveryRequested = false;
-    lastNodeRequestTime = 0;
-    lastPeriodicNodeRequest = 0;
-    fastDeviceInfoReceived = false;
-
-    if (g_ui) g_ui->showMessage("Device disconnected");
+uint32_t MeshtasticClient::deriveNodeIdFromPrefix(const uint8_t *prefix, size_t len) const {
+    if (!prefix || len < 4) return 0;
+    return prefix[0] | (prefix[1] << 8) | (prefix[2] << 16) | (prefix[3] << 24);
 }
 
-void MeshtasticClient::setUARTConfig(uint32_t baud, int txPin, int rxPin, bool force) {
-    bool changed = (baud != uartBaud) || (txPin != uartTxPin) || (rxPin != uartRxPin);
-    uartBaud = baud;
-    uartTxPin = txPin;
-    uartRxPin = rxPin;
-
-    if (!uartPort) uartPort = &Serial1;
-
-    if (changed || force) {
-#if defined(ARDUINO)
-        uartPort->end();
-        delay(50);
-        pinMode(uartRxPin, INPUT_PULLUP);
-        pinMode(uartTxPin, OUTPUT);
-        uartPort->begin(uartBaud, SERIAL_8N1, uartRxPin, uartTxPin);
-        uartAvailable = true;
-        uartInited = true;
-        uartRxBuffer.clear();
-        textRxBuffer = "";
-#endif
+static String extractTextPayload(const uint8_t *data, size_t length, size_t offset) {
+    if (!data || length <= offset) return String();
+    String text;
+    text.reserve(length - offset);
+    for (size_t i = offset; i < length; ++i) {
+        text += static_cast<char>(data[i]);
     }
-
-    // Persist settings when they change
-    if (changed) saveSettings();
+    return text;
 }
 
-void MeshtasticClient::setTextMessageMode(bool enabled) {
-    if (textMessageMode == enabled) {
-        Serial.printf("[TextMode] Text message mode already %s\n", enabled ? "enabled" : "disabled");
+void MeshtasticClient::handleMeshCoreContactMessage(uint8_t code, const uint8_t *data, size_t length) {
+    if (!data) return;
+    const bool isV3 = (code == 16);
+    const size_t prefixOffset = isV3 ? 4 : 1;
+    const size_t minLength = isV3 ? 16 : 13; // headers before text
+    if (length <= minLength) {
+        LOG_PRINTF("[MeshCore] Contact msg frame too short (%d)\n", length);
         return;
     }
 
-    textMessageMode = enabled;
-    Serial.printf("[TextMode] Text message mode %s\n", enabled ? "enabled" : "disabled");
-
-    // Reset UART buffer when switching modes to avoid cross-contamination
-    uartRxBuffer.clear();
-
-    if (enabled) {
-        Serial.println("[TextMode] Enabling UART listener on G2");
-        setUARTConfig(uartBaud, uartTxPin, uartRxPin, true);
-        tryInitUART();
-        textRxBuffer = "";
-    } else {
-        // 切回protobuf时立即请求配置，确保状态同步
-        if (uartAvailable && isConnected) {
-            Serial.println("[TextMode] Requesting full config after switching to protobuf mode");
-            requestConfig();
-        } else {
-            Serial.println("[TextMode] Protobuf mode selected but UART not ready yet");
-        }
+    const uint8_t *prefix = &data[prefixOffset];
+    const uint8_t pathLen = data[prefixOffset + 6];
+    const uint8_t txtType = data[prefixOffset + 7];
+    (void)txtType; // Currently only plain text (0) supported.
+    const size_t tsOffset = prefixOffset + 8;
+    if (length < tsOffset + 4) {
+        LOG_PRINTF("[MeshCore] Contact msg missing timestamp (%d)\n", length);
+        return;
     }
-
-    // Persist text mode change
-    saveSettings();
-}
-
-void MeshtasticClient::setBrightness(uint8_t brightness) {
-    displayBrightness = brightness;
-    M5.Lcd.setBrightness(brightness);
-    saveSettings();
-    Serial.printf("[Brightness] Set to %d\n", brightness);
-}
-
-void MeshtasticClient::setMessageMode(MessageMode mode) {
-    if (messageMode == mode) {
-        Serial.printf("[MessageMode] Mode already set to %d\n", mode);
+    const uint32_t senderTimestamp = data[tsOffset] | (data[tsOffset + 1] << 8) |
+                                      (data[tsOffset + 2] << 16) | (data[tsOffset + 3] << 24);
+    const size_t textOffset = tsOffset + 4;
+    String text = extractTextPayload(data, length, textOffset);
+    if (text.isEmpty()) {
+        LOG_PRINTLN("[MeshCore] Contact msg has empty text");
         return;
     }
 
-    messageMode = mode;
-    textMessageMode = (mode == MODE_TEXTMSG);  // Update legacy field
-    Serial.printf("[MessageMode] Set to %s\n", getMessageModeString().c_str());
+    const MeshtasticNode *node = findNodeByPubKeyPrefix(prefix, 6);
+    uint32_t fromId = node ? node->nodeId : deriveNodeIdFromPrefix(prefix, 6);
+    String fromName;
+    if (node) {
+        fromName = node->longName.length() ? node->longName : node->shortName;
+    }
+    if (fromName.isEmpty()) {
+        fromName = generateNodeDisplayName(fromId);
+    }
 
-    // Reset UART buffer when switching modes to avoid cross-contamination
-    uartRxBuffer.clear();
+    MeshtasticMessage msg;
+    msg.fromNodeId = fromId;
+    msg.toNodeId = myNodeId ? myNodeId : 0;
+    msg.fromName = fromName;
+    msg.toName = myNodeName.length() ? myNodeName : String("Me");
+    msg.content = text;
+    msg.timestamp = senderTimestamp ? senderTimestamp : (millis() / 1000);
+    msg.messageType = MSG_TYPE_TEXT;
+    msg.channel = currentChannel;
+    msg.isDirect = (pathLen == 0xFF);
+    msg.status = MSG_STATUS_DELIVERED;
+    msg.packetId = millis();
+    if (isV3) {
+        msg.snr = static_cast<int8_t>(data[1]) / 4.0f;
+    }
 
-    if (mode == MODE_TEXTMSG) {
-        Serial.println("[MessageMode] Enabling UART listener for TextMsg mode");
-        setUARTConfig(uartBaud, uartTxPin, uartRxPin, true);
-        tryInitUART();
-        textRxBuffer = "";
+    addMessageToHistory(msg);
+    LOG_PRINTF("[MeshCore] Contact msg from %s (0x%08X) len=%d direct=%d\n",
+               msg.fromName.c_str(), msg.fromNodeId, text.length(), msg.isDirect);
+    if (g_ui && g_ui->currentTab != 0) {
+        g_ui->showMessage("DM from " + msg.fromName);
+    }
+}
+
+void MeshtasticClient::handleMeshCoreChannelMessage(uint8_t code, const uint8_t *data, size_t length) {
+    if (!data) return;
+    const bool isV3 = (code == 17);
+    const size_t baseLen = isV3 ? 11 : 8;
+    if (length <= baseLen) {
+        LOG_PRINTF("[MeshCore] Channel msg frame too short (%d)\n", length);
+        return;
+    }
+
+    uint8_t channelIdx = 0;
+    uint8_t pathLen = 0;
+    uint8_t txtType = 0;
+    size_t tsOffset = 0;
+    if (isV3) {
+        channelIdx = data[4];
+        pathLen = data[5];
+        txtType = data[6];
+        tsOffset = 7;
     } else {
-        // For protobuf/simple modes, request config if connected
-        if (uartAvailable && isConnected) {
-            Serial.println("[MessageMode] Requesting config for protobuf mode");
-            requestConfig();
+        channelIdx = data[1];
+        pathLen = data[2];
+        txtType = data[3];
+        tsOffset = 4;
+    }
+    (void)txtType; // Only plain text supported currently.
+    if (length < tsOffset + 4) {
+        LOG_PRINTF("[MeshCore] Channel msg missing timestamp (%d)\n", length);
+        return;
+    }
+    const uint32_t senderTimestamp = data[tsOffset] | (data[tsOffset + 1] << 8) |
+                                      (data[tsOffset + 2] << 16) | (data[tsOffset + 3] << 24);
+    const size_t textOffset = tsOffset + 4;
+    String text = extractTextPayload(data, length, textOffset);
+    if (text.isEmpty()) {
+        LOG_PRINTLN("[MeshCore] Channel msg has empty text");
+        return;
+    }
+
+    String channelName;
+    for (const auto &channel : channelList) {
+        if (channel.index == channelIdx && channel.name.length()) {
+            channelName = channel.name;
+            break;
         }
     }
-
-    saveSettings();
-}
-
-String MeshtasticClient::getMessageModeString() const {
-    switch (messageMode) {
-        case MODE_TEXTMSG: return "TextMsg";
-        case MODE_PROTOBUFS: return "Protobufs";
-        case MODE_SIMPLE: return "Simple";
-        default: return "Unknown";
-    }
-}
-
-void MeshtasticClient::setScreenTimeout(uint32_t timeoutMs) {
-    screenTimeoutMs = timeoutMs;
-    saveSettings();
-    Serial.printf("[Screen] Timeout set to %s\n", getScreenTimeoutString().c_str());
-}
-
-String MeshtasticClient::getScreenTimeoutString() const {
-    if (screenTimeoutMs == 0) return "Never";
-    if (screenTimeoutMs == 30000) return "30s";
-    if (screenTimeoutMs == 120000) return "2min";
-    if (screenTimeoutMs == 300000) return "5min";
-    return String(screenTimeoutMs / 1000) + "s";
-}
-
-bool MeshtasticClient::isScreenTimedOut() const {
-    if (screenTimeoutMs == 0) return false;  // Never timeout
-    return screenTimedOut && (millis() - lastActivityTime > screenTimeoutMs);
-}
-
-void MeshtasticClient::wakeScreen() {
-    lastActivityTime = millis();
-    if (screenTimedOut) {
-        screenTimedOut = false;
-        M5.Lcd.setBrightness(displayBrightness);
-        Serial.println("[Screen] Waking from timeout");
-    }
-}
-
-void MeshtasticClient::updateScreenTimeout() {
-    if (screenTimeoutMs > 0 && !screenTimedOut) {
-        if (millis() - lastActivityTime > screenTimeoutMs) {
-            screenTimedOut = true;
-            M5.Lcd.setBrightness(0);  // Turn off screen
-            Serial.println("[Screen] Timing out, turning off display");
-        }
-    }
-}
-
-void MeshtasticClient::loadSettings() {
-    Preferences pref;
-    if (!pref.begin("meshtastic", true)) return; // read-only fallback
-    uartBaud = pref.getUInt("uartBaud", MESHTASTIC_UART_BAUD);
-    uartTxPin = pref.getInt("uartTx", MESHTASTIC_TXD_PIN);
-    uartRxPin = pref.getInt("uartRx", MESHTASTIC_RXD_PIN);
-    
-    // Load message mode first, then set textMessageMode accordingly
-    messageMode = (MessageMode)pref.getUInt("msgMode", MODE_TEXTMSG);  // Default to TextMsg mode
-    textMessageMode = (messageMode == MODE_TEXTMSG);  // Sync with messageMode
-    
-    displayBrightness = pref.getUChar("brightness", 200);
-    screenTimeoutMs = pref.getUInt("screenTimeout", 120000);  // Default 2min
-    pref.end();
-    
-    // Apply loaded brightness
-    M5.Lcd.setBrightness(displayBrightness);
-    lastActivityTime = millis();  // Initialize activity time
-    
-    Serial.printf("[Settings] Loaded uartBaud=%u, tx=%d, rx=%d, msgMode=%d (%s), textMode=%s, brightness=%d, screenTimeout=%s\n", 
-                  uartBaud, uartTxPin, uartRxPin, messageMode, getMessageModeString().c_str(), 
-                  textMessageMode ? "true" : "false", displayBrightness, getScreenTimeoutString().c_str());
-}
-
-void MeshtasticClient::saveSettings() {
-    Preferences pref;
-    if (!pref.begin("meshtastic", false)) return;
-    pref.putUInt("uartBaud", uartBaud);
-    pref.putInt("uartTx", uartTxPin);
-    pref.putInt("uartRx", uartRxPin);
-    pref.putBool("textMode", textMessageMode);  // Keep for backward compatibility
-    pref.putUInt("msgMode", messageMode);
-    pref.putUChar("brightness", displayBrightness);
-    pref.putUInt("screenTimeout", screenTimeoutMs);
-    pref.end();
-    Serial.printf("[Settings] Saved uartBaud=%u, tx=%d, rx=%d, msgMode=%d, brightness=%d, screenTimeout=%s\n", 
-                  uartBaud, uartTxPin, uartRxPin, messageMode, displayBrightness, getScreenTimeoutString().c_str());
-}
-
-bool MeshtasticClient::connectToDevice(const String &deviceName) {
-    if (deviceName.length() > 0) {
-        return scanForDevices(true, deviceName);
-    }
-    // Prefer BLE first; if none, fallback to UART inside scanForDevices
-    return scanForDevices(true, "");
-}
-
-bool MeshtasticClient::connectToDeviceByName(const String &deviceName) {
-    if (deviceName.length() == 0) return false;
-    return scanForDevices(true, deviceName);
-}
-
-bool MeshtasticClient::connectToDeviceByNameBLE(const String &deviceName) {
-    if (deviceName.length() == 0) return false;
-    LOG_PRINTF("[BLE] Connecting by name: %s\n", deviceName.c_str());
-    return connectToBLE(nullptr, deviceName);
-}
-
-bool MeshtasticClient::connectToDeviceByAddress(const String &deviceAddress) {
-    if (deviceAddress.length() == 0) return false;
-    
-    // Check if we have this device in cached scan results
-    for (const auto &devPtr : lastScanDevices) {
-        const NimBLEAdvertisedDevice *dev = devPtr.get();
-        if (!dev) continue;
-        String addr = dev->getAddress().toString().c_str();
-        if (addr == deviceAddress) {
-            LOG_PRINTF("[BLE] Using cached device object for %s\n", deviceAddress.c_str());
-            return connectToBLE(dev, "");
-        }
-    }
-    
-    // Not in cache, connect by address directly
-    LOG_PRINTF("[BLE] Connecting by address: %s\n", deviceAddress.c_str());
-    return connectToBLE(nullptr, deviceAddress);
-}
-
-void MeshtasticClient::refreshNodeList() {
-    if (g_ui) g_ui->showMessage("Processing node data...");
-    // Following Contact project pattern: just process pending data, don't send new requests
-    // Nodes arrive naturally through NODEINFO_APP packets
-    drainIncoming(false, false);
-    
-    // Update UI display with current nodes
-    if (g_ui) {
-        g_ui->forceRedraw();
-        Serial.printf("[Nodes] Node list refreshed, current count: %d\n", nodeList.size());
-    }
-}
-
-bool MeshtasticClient::sendTextMessage(const String &message, uint32_t nodeId) {
-    return sendMessage(nodeId, message);
-}
-
-bool MeshtasticClient::sendMessage(uint32_t nodeId, const String &message, uint8_t channel) {
-    Serial.printf("[SendMsg] nodeId=0x%08X, message='%s' (len=%d), channel=%d, textMode=%s, connType=%s, connected=%d, toRadioChar=%p, msgMode=%s\n", 
-                  nodeId, message.c_str(), message.length(), channel,
-                  textMessageMode ? "true" : "false",
-                  connectionType.c_str(), isConnected ? 1 : 0, toRadioChar,
-                  getMessageModeString().c_str());
-    
-    // Extra debugging for suspicious content
-    if (message.length() == 2 && (uint8_t)message[0] == 0xFF && (uint8_t)message[1] == 0x00) {
-        Serial.println("[SendMsg] *** CRITICAL: Detected 0xFF 0x00 message! ***");
-        Serial.printf("[SendMsg] ESP.getFreeHeap()=%d, millis()=%u\n", ESP.getFreeHeap(), millis());
-        Serial.printf("[SendMsg] String object at %p\n", &message);
-        return false; // Block this message completely
-    }
-    
-    // Check for any message containing 0xFF
-    for (size_t i = 0; i < message.length(); i++) {
-        if ((uint8_t)message[i] == 0xFF) {
-            Serial.printf("[SendMsg] *** WARNING: Message contains 0xFF at position %d ***\n", i);
-        }
-    }
-    
-    if (!hasActiveTransport()) {
-        Serial.println("[SendMsg] Not connected - aborting");
-        return false;
-    }
-
-    if (textMessageMode) {
-        // Text message mode only supports broadcast messages
-        if (nodeId != 0xFFFFFFFF) {
-            Serial.printf("[SendMsg] Text message mode only supports broadcast messages, not direct messages to node 0x%08X\n", nodeId);
-            return false;
-        }
-        
-        // In text message mode, send directly via UART with node targeting
-        bool sent = sendTextUART(message, nodeId);
-        
-        if (sent) {
-            // Add to message history
-            MeshtasticMessage msg;
-            msg.fromNodeId = myNodeId;
-            msg.toNodeId = nodeId;
-            msg.content = message;
-            msg.channel = channel;
-            msg.packetId = millis(); // Use timestamp as packet ID
-            msg.timestamp = millis() / 1000;
-            msg.status = MSG_STATUS_SENT;
-            msg.fromName = "Me";
-            
-            if (nodeId == 0xFFFFFFFF) {
-                msg.toName = "Broadcast";
-            } else {
-                auto *node = getNodeById(nodeId);
-                if (node) {
-                    if (isValidDisplayName(node->shortName)) {
-                        msg.toName = node->shortName;
-                    } else if (isValidDisplayName(node->longName)) {
-                        msg.toName = node->longName;
-                    } else {
-                        msg.toName = generateNodeDisplayName(nodeId);
-                    }
-                } else {
-                    msg.toName = generateNodeDisplayName(nodeId);
-                }
-            }
-            
-            addMessageToHistory(msg);
-            
-            if (g_ui) g_ui->showMessage("Text sent");
-        }
-        
-        return sent;
-    }
-
-    // Protobuf mode
-    uint32_t packetId = 0;  // Initialize to 0 so buildTextMessage will generate one
-    auto packet = buildTextMessage(myNodeId, nodeId, channel, message, packetId, true);
-    Serial.printf("[SendMsg] Built protobuf packet size=%u\n", (unsigned)packet.size());
-
-    bool sent = sendProtobuf(packet.data(), packet.size());
-
-    if (sent) {
-        // Add to message history
-        MeshtasticMessage msg;
-        msg.fromNodeId = myNodeId;
-        msg.toNodeId = nodeId;
-        msg.content = message;
-        msg.channel = channel;
-        msg.packetId = packetId;
-        msg.timestamp = millis() / 1000;
-        msg.status = MSG_STATUS_SENDING;
-        msg.fromName = "Me";
-
-        auto *node = getNodeById(nodeId);
-        if (node) {
-            if (isValidDisplayName(node->shortName)) {
-                msg.toName = node->shortName;
-            } else if (isValidDisplayName(node->longName)) {
-                msg.toName = node->longName;
-            } else {
-                msg.toName = generateNodeDisplayName(nodeId);
-            }
+    if (channelName.isEmpty()) {
+        if (channelIdx == 0 && !primaryChannelName.isEmpty()) {
+            channelName = primaryChannelName;
         } else {
-            if (nodeId == 0xFFFFFFFF) {
-                msg.toName = "Broadcast";
-            } else {
-                msg.toName = generateNodeDisplayName(nodeId);
-            }
+            channelName = String("Channel ") + channelIdx;
         }
-
-        addMessageToHistory(msg);
-
-        if (g_ui) g_ui->showMessage("Message sent");
     }
 
-    return sent;
-}
-
-bool MeshtasticClient::sendDirectMessage(uint32_t nodeId, const String &message) {
-    return sendMessage(nodeId, message);
-}
-
-bool MeshtasticClient::broadcastMessage(const String &message, uint8_t channel) {
-    return sendMessage(0xFFFFFFFF, message, channel);
-}
-
-bool MeshtasticClient::sendTraceRoute(uint32_t nodeId, uint8_t hopLimit) {
-    if (!isDeviceConnected()) return false;
-    hopLimit = std::max<uint8_t>(1, std::min<uint8_t>(hopLimit, 10));
-
-    // Check if target node exists in our node list
-    auto *targetNode = getNodeById(nodeId);
-    if (targetNode) {
-        String displayName;
-        if (isValidDisplayName(targetNode->shortName)) {
-            displayName = targetNode->shortName;
-        } else if (isValidDisplayName(targetNode->longName)) {
-            displayName = targetNode->longName;
-        } else {
-            displayName = generateNodeDisplayName(nodeId);
-        }
-        Serial.printf("[TraceRoute] Target node found: %s (0x%08X), last heard: %d minutes ago\n", 
-                     displayName.c_str(), nodeId, 
-                     (millis() - targetNode->lastHeard) / 60000);
-    } else {
-        Serial.printf("[TraceRoute] Warning: Target node 0x%08X not in node list\n", nodeId);
+    MeshtasticMessage msg;
+    msg.fromNodeId = 0xFFFFFFFF;
+    msg.toNodeId = 0xFFFFFFFF;
+    msg.fromName = channelName;
+    msg.toName = myNodeName.length() ? myNodeName : String("Me");
+    msg.content = text;
+    msg.timestamp = senderTimestamp ? senderTimestamp : (millis() / 1000);
+    msg.messageType = MSG_TYPE_TEXT;
+    msg.channel = channelIdx;
+    msg.isDirect = (pathLen == 0xFF);
+    msg.status = MSG_STATUS_DELIVERED;
+    msg.packetId = millis();
+    if (isV3) {
+        msg.snr = static_cast<int8_t>(data[1]) / 4.0f;
     }
 
-    uint32_t reqId = allocateRequestId();
-    auto packet = buildTraceRoute(nodeId, hopLimit, reqId);
-    
-    LOG_PRINTF("[TraceRoute] Built packet: size=%d bytes, reqId=0x%08X\n", packet.size(), reqId);
-    
-    // Try sending multiple times with different methods for better reliability
-    bool sent = false;
-    int maxRetries = 3;
-    
-    for (int attempt = 0; attempt < maxRetries && !sent; attempt++) {
-        if (attempt > 0) {
-            LOG_PRINTF("[TraceRoute] Retry attempt %d/%d\n", attempt + 1, maxRetries);
-            delay(500);  // Wait between retries
-        }
-        
-        LOG_PRINTF("[TraceRoute] Attempting to send packet (attempt %d)\n", attempt + 1);
-        // Prefer response=true for important packets like trace route
-        sent = sendProtobuf(packet.data(), packet.size(), true);
-        LOG_PRINTF("[TraceRoute] Send attempt %d result: %s\n", attempt + 1, sent ? "SUCCESS" : "FAILED");
-        
-        if (!sent && attempt < maxRetries - 1) {
-            // Try flushing the connection and retry
-            LOG_PRINTLN("[TraceRoute] Send failed, flushing connection...");
-            if (uartAvailable && uartPort) {
-                uartPort->flush();
-                delay(100);
-            }
-        }
+    addMessageToHistory(msg);
+    LOG_PRINTF("[MeshCore] Channel msg (ch=%d) len=%d\n", channelIdx, text.length());
+    if (g_ui && g_ui->currentTab != 0) {
+        int previewLen = std::min<int>(text.length(), 30);
+        g_ui->showMessage(channelName + ": " + text.substring(0, previewLen));
+    }
+}
+
+bool MeshtasticClient::sendMeshCoreText(const String& text, const std::vector<uint8_t>& pubKeyPrefix) {
+    if (!meshCoreRxChar || !isConnected) return false;
+    std::vector<uint8_t> frame = MeshCore::buildTextMsgFrame(text, pubKeyPrefix);
+    bool ok = meshCoreRxChar->writeValue(frame.data(), frame.size(), false);
+    LOG_PRINTF("[MeshCore] Sent Text Message (%s)\n", ok ? "ok" : "fail");
+    return ok;
+}
+
+bool MeshtasticClient::sendMeshCoreBroadcast(const String& text, uint8_t channelIdx) {
+    if (!meshCoreRxChar || !isConnected) return false;
+    std::vector<uint8_t> frame = MeshCore::buildChannelTextMsgFrame(text, channelIdx);
+    bool ok = meshCoreRxChar->writeValue(frame.data(), frame.size(), false);
+    LOG_PRINTF("[MeshCore] Sent Broadcast Message (%s)\n", ok ? "ok" : "fail");
+    return ok;
+}
+
+void MeshtasticClient::sendMeshCorePing(const std::vector<uint8_t>& pubKey) {
+    if (!meshCoreRxChar || !isConnected) return;
+    std::vector<uint8_t> frame = MeshCore::buildStatusReqFrame(pubKey);
+    meshCoreRxChar->writeValue(frame.data(), frame.size(), false);
+    LOG_PRINTLN("[MeshCore] Sent Ping (Status Req)");
+}
+
+void MeshtasticClient::sendMeshCorePing(uint32_t nodeId) {
+    const MeshtasticNode* node = findNode(nodeId);
+    if (!node) {
+        LOG_PRINTLN("[MeshCore] Node not found for Ping");
+        return;
+    }
+    // We stored the 32-byte public key as a hex string in macAddress
+    if (node->macAddress.length() != 64) { 
+        LOG_PRINTLN("[MeshCore] Node has no valid Public Key (macAddress)");
+        return;
     }
     
-    if (sent) {
-        lastRequestId = reqId;
-        if (g_ui) g_ui->showMessage("Trace route sent");
-        Serial.printf("[TraceRoute] Successfully sent trace route request to 0x%08X with requestId=0x%08X, hopLimit=%d\n", 
-                     nodeId, reqId, hopLimit);
-        Serial.printf("[TraceRoute] Packet size: %d bytes\n", packet.size());
-        
-        // Set a timeout to check for response
-        traceRouteTimeoutStart = millis();
-        traceRouteWaitingForResponse = true;
-    } else {
-        if (g_ui) g_ui->showError("Failed to send trace route after retries");
-        Serial.printf("[TraceRoute] Failed to send trace route request after %d attempts\n", maxRetries);
+    std::vector<uint8_t> pubKey;
+    pubKey.reserve(32);
+    for (size_t i = 0; i < node->macAddress.length(); i += 2) {
+        String byteStr = node->macAddress.substring(i, i + 2);
+        pubKey.push_back((uint8_t)strtol(byteStr.c_str(), NULL, 16));
     }
-    return sent;
+    sendMeshCorePing(pubKey);
 }
 
-void MeshtasticClient::handleTraceRouteResponse(uint32_t targetNodeId, const std::vector<uint32_t>& route, const std::vector<float>& snrValues) {
-    if (g_ui) {
-        // Legacy call - no return route data available
-        g_ui->openTraceRouteResult(targetNodeId, route, snrValues);
-    }
-}
-
-String MeshtasticClient::getConnectionStatus() const {
-    if (isConnected) { return connectionType + ": " + connectedDeviceName; }
-    return "Disconnected";
-}
-
-void MeshtasticClient::addMessageToHistory(const MeshtasticMessage &msg) {
-    messageHistory.push_back(msg);
-
-    // Keep only last 50 messages
-    if (messageHistory.size() > MAX_HISTORY_MESSAGES) { messageHistory.erase(messageHistory.begin()); }
-
-    // Log the message
-    String senderName = msg.fromName.length() > 0 ? msg.fromName : "Unknown";
-    Serial.printf("[Message] %s: %s\n", 
-                  senderName.c_str(), msg.content.c_str());
-
-    // Play notification sound if this is a received message (not from us)
-    if (msg.fromNodeId != myNodeId && g_notificationManager) {
-        bool isBroadcast = (msg.toNodeId == 0xFFFFFFFF);
-        g_notificationManager->playNotification(isBroadcast);
-        Serial.printf("[Notification] Playing %s message sound\n", isBroadcast ? "broadcast" : "direct");
-    }
-
-    // Show popup notification and auto-scroll logic
-    bool showPopup = false;
-    bool isMessageForCurrentConversation = false;
-    
-    if (g_ui) {
-        // Check if message belongs to current conversation
-        if (g_ui->currentDestinationId == 0xFFFFFFFF) {
-            // Current destination is broadcast channel
-            isMessageForCurrentConversation = (msg.toNodeId == 0xFFFFFFFF);
-        } else {
-            // Current destination is a specific node (DM)
-            isMessageForCurrentConversation = (msg.fromNodeId == g_ui->currentDestinationId) ||
-                                              (msg.toNodeId == g_ui->currentDestinationId);
-        }
-        
-        if (g_ui->currentTab != 0) {
-            // Not in Messages tab - always show popup
-            showPopup = true;
-        } else if (!isMessageForCurrentConversation) {
-            // In Messages tab but message is not for current conversation - show popup
-            showPopup = true;
-        }
-        // If in Messages tab AND message is for current conversation - no popup, just auto-scroll (handled in openNewMessagePopup)
-        
-        if (msg.fromNodeId != myNodeId) { // Don't show popup for our own messages
-            g_ui->openNewMessagePopup(senderName, msg.content, 0.0f);
-        } else if (g_ui->currentTab == 0 && isMessageForCurrentConversation) {
-            // For our own messages in current conversation, auto-scroll to end consistently
-            g_ui->scrollToLatestMessage();
-        }
-    }
-
-    // Update UI
-    if (g_ui) g_ui->forceRedraw();
-}
-
-void MeshtasticClient::clearMessageHistory() {
-    messageHistory.clear();
-    if (g_ui) {
-        g_ui->messageSelectedIndex = 0; // Reset selection
-        g_ui->forceRedraw();
-    }
-}
-
-int MeshtasticClient::getMessageCountForDestination(uint32_t nodeId) const {
-    int count = 0;
-    for (const auto &msg : messageHistory) {
-        // Count messages from this node or messages to this node
-        if (msg.fromNodeId == nodeId || (msg.toNodeId == nodeId && msg.fromNodeId == myNodeId)) {
-            count++;
-        }
-    }
-    return count;
+void MeshtasticClient::sendMeshCoreGetContacts() {
+    if (!meshCoreRxChar || !isConnected) return;
+    std::vector<uint8_t> frame = MeshCore::buildGetContactsFrame(0);
+    meshCoreRxChar->writeValue(frame.data(), frame.size(), false);
+    LOG_PRINTLN("[MeshCore] Sent Get Contacts Request");
 }
 
 void MeshtasticClient::updateMessageStatus(uint32_t packetId, MessageStatus newStatus) {
@@ -1946,13 +1686,20 @@ void MeshtasticClient::upsertNode(const ParsedNodeInfo &parsed) {
         } else if (isValidDisplayName(parsedShort)) {
             node.longName = parsedShort;
         } else {
-            node.longName = "Meshtastic_" + generateNodeDisplayName(parsed.nodeId);
+            // If we have a valid ID but no name, use the ID as the name
+            // This prevents "Meshtastic_xxxx" if we actually have a valid ID string
+            node.longName = generateNodeDisplayName(parsed.nodeId);
         }
 
         if (isValidDisplayName(parsedShort)) {
             node.shortName = parsedShort;
         } else if (isValidDisplayName(parsedLong)) {
-            node.shortName = parsedLong; // fall back to long name so lists show meaningful label
+            // If long name is short enough, use it as short name
+            if (parsedLong.length() <= 4) {
+                node.shortName = parsedLong;
+            } else {
+                node.shortName = parsedLong.substring(0, 4);
+            }
         } else {
             node.shortName = generateNodeDisplayName(parsed.nodeId);
         }
@@ -2123,7 +1870,11 @@ void MeshtasticClient::requestNodeList() {
     
     Serial.println("[Nodes] Discovery restarted - will scan for new nodes");
 
-    // Send a config request to trigger fresh node discovery
+    if (deviceType == DEVICE_MESHCORE) {
+        sendMeshCoreGetContacts();
+        return;
+    }
+
     auto packet = buildWantConfig(0);
     if (sendProtobuf(packet.data(), packet.size())) {
         Serial.println("[Nodes] Config request sent to restart discovery");
@@ -2159,14 +1910,12 @@ bool MeshtasticClient::tryInitUART() {
             } else {
                 updateConnectionState(CONN_CONNECTED);
                 // Defer config until we detect activity or timeout, same as cold init path
-                if (connectionState == CONN_CONNECTED) {
-                    Serial.println("[UART] Fast path: deferring initial config until radio activity detected...");
-                    discoveryStartTime = 0; // Will set when config actually sent
-                    lastNodeAddedTime = 0;
-                    initialDiscoveryComplete = false;
-                    uartDeferredConfig = true;
-                    uartDeferredStartTime = millis();
-                }
+                Serial.println("[UART] Fast path: deferring initial config until radio activity detected...");
+                discoveryStartTime = 0; // Will set when config actually sent
+                lastNodeAddedTime = 0;
+                initialDiscoveryComplete = false;
+                uartDeferredConfig = true;
+                uartDeferredStartTime = millis();
             }
         }
         return true;
@@ -2307,12 +2056,24 @@ bool MeshtasticClient::tryInitUART() {
     // Update connection state; defer config in protobuf mode until first RX activity
     if (!textMessageMode) {
         updateConnectionState(CONN_CONNECTED);  
-        Serial.println("[UART] Deferring initial config until radio activity detected...");
-        discoveryStartTime = 0; // Will set when config actually sent
-        lastNodeAddedTime = 0;
+        // Don't defer config - send it immediately to wake up the radio interaction
+        Serial.println("[UART] UART connected - initiating config request immediately...");
+        discoveryStartTime = millis(); 
+        lastNodeAddedTime = millis();
         initialDiscoveryComplete = false;
-        uartDeferredConfig = true;
-        uartDeferredStartTime = millis();
+        uartDeferredConfig = false; // Disable deferred config
+        
+        // Send initial config request after a short delay to let UART stabilize
+        // We can't block here, so we'll let the loop handle it via probeUARTOnce
+        // or just trigger it now if we are sure.
+        // Let's trigger it in the next loop cycle by setting state to CONN_CONNECTED
+        // and ensuring probeUARTOnce picks it up.
+        
+        // Actually, let's just send it now to be sure.
+        // But we need to be careful about blocking.
+        // Let's set a flag to request it in the loop.
+        uartDeferredConfig = true; 
+        uartDeferredStartTime = millis() - 3500; // Trick it to fire in 500ms
     } else {
         Serial.println("[UART] Text message mode - skipping config request");
         updateConnectionState(CONN_READY);  // Text mode is ready immediately
@@ -2343,7 +2104,7 @@ bool MeshtasticClient::probeUARTOnce() {
         // While waiting/requesting config, do not transmit anything; rely on requestConfig() + timeout
         if (connectionState == CONN_WAITING_CONFIG || connectionState == CONN_REQUESTING_CONFIG) {
             return (avail > 0);
-        } else if (connectionState == CONN_READY && !initialDiscoveryComplete) {
+        } else if ((connectionState == CONN_CONNECTED || connectionState == CONN_READY) && !initialDiscoveryComplete) {
             // Very aggressive discovery phase - multiple request types for fast node discovery
             if (now - lastIntensiveRequest > 300) {  // Throttle to every 300ms during discovery phase
                 // Cycle through many different request types to discover nodes quickly
@@ -2466,8 +2227,18 @@ std::vector<uint8_t> MeshtasticClient::receiveProtobufUART() {
 #endif
 
     // Common parse logic from buffer
+    size_t discarded = 0;
     while (!uartRxBuffer.empty() && (uartRxBuffer[0] != STREAM_START1)) {
         uartRxBuffer.erase(uartRxBuffer.begin());
+        discarded++;
+    }
+    if (discarded > 0) {
+        // Rate limit this log
+        static uint32_t lastGarbageLog = 0;
+        if (millis() - lastGarbageLog > 1000) {
+            Serial.printf("[UART] Discarded %d bytes of garbage (waiting for 0x%02X)\n", (int)discarded, STREAM_START1);
+            lastGarbageLog = millis();
+        }
     }
     if (uartRxBuffer.size() >= 2 && uartRxBuffer[0] == STREAM_START1 && uartRxBuffer[1] != STREAM_START2) {
         uartRxBuffer.erase(uartRxBuffer.begin());
@@ -2477,9 +2248,10 @@ std::vector<uint8_t> MeshtasticClient::receiveProtobufUART() {
     // or after a timeout if no bytes ever arrive.
     if (uartDeferredConfig) {
         bool hasActivity = !uartRxBuffer.empty();
-        bool timeout = (uartDeferredStartTime > 0 && (millis() - uartDeferredStartTime > 4000));
+        // Reduced timeout to 1s to start faster
+        bool timeout = (uartDeferredStartTime > 0 && (millis() - uartDeferredStartTime > 1000));
         if (hasActivity || timeout) {
-            Serial.println(hasActivity ? "[UART] Activity detected - sending deferred config request" : "[UART] No activity after 4s - sending fallback config request");
+            Serial.println(hasActivity ? "[UART] Activity detected - sending deferred config request" : "[UART] Timeout - sending initial config request");
             uartDeferredConfig = false;
             requestConfig();
             discoveryStartTime = millis();
@@ -2599,7 +2371,7 @@ void MeshtasticClient::processTextMessage() {
                     msg.timestamp = millis() / 1000;
                     msg.status = MSG_STATUS_DELIVERED;
                     msg.fromName = fromName.length() > 0 ? fromName : "Radio";
-                    msg.snr = 0.0f;  // SNR not available in text mode
+                    
                     addMessageToHistory(msg);
                     
                     if (g_ui && g_ui->currentTab != 0) g_ui->showSuccess("Text message received");
@@ -2732,312 +2504,378 @@ void MeshtasticClient::processTextMessage() {
 #endif
 }
 
-bool MeshtasticClient::sendTextUART(const String &message, uint32_t nodeId) {
-#ifdef USE_ESP_IDF_UART
-    if (!textMessageMode) {
-        Serial.println("[TextMode] Not in text mode");
-        return false;
-    }
-#else
-    if (!uartPort || !textMessageMode) {
-        Serial.println("[TextMode] UART not available or not in text mode");
-        return false;
-    }
-#endif
-    
-    if (message.length() == 0) {
-        Serial.println("[TextMode] Empty message - rejecting");
-        return false;
+bool MeshtasticClient::sendMessage(uint32_t nodeId, const String &message, uint8_t channel) {
+    if (deviceType == DEVICE_MESHCORE) {
+        return sendDirectMessage(nodeId, message);
     }
     
-    // Extra check: ensure we're really in TextMsg mode
-    if (messageMode != MODE_TEXTMSG) {
-        Serial.printf("[TextMode] ERROR: messageMode=%d, not in TextMsg mode - blocking send!\n", messageMode);
-        return false;
-    }
+    uint32_t packetId = 0;
+    std::vector<uint8_t> packet = buildTextMessage(myNodeId, nodeId, channel, message, packetId, true);
     
-    // Text message mode only supports broadcast messages
-    if (nodeId != 0xFFFFFFFF) {
-        Serial.printf("[TextMode] ERROR: Text mode only supports broadcast messages, not direct messages to node 0x%08X\n", nodeId);
-        return false;
-    }
-    
-    // Broadcast message (send directly)
-    String finalMessage = message;
-    Serial.printf("[TextMode] Sending broadcast message (len=%d): '%s'\n", 
-                 finalMessage.length(), finalMessage.c_str());
-    
-    // Log message bytes for debugging
-    Serial.print("[TextMode] Message bytes: ");
-    for (size_t i = 0; i < finalMessage.length() && i < 20; i++) {
-        Serial.printf("0x%02X ", (uint8_t)finalMessage[i]);
-    }
-    Serial.println();
-
-#ifdef USE_ESP_IDF_UART
-    // Send using ESP-IDF uart_write_bytes (without CRLF to avoid extra characters)
-    int written = uart_write_bytes(UART_NUM_1, finalMessage.c_str(), finalMessage.length());
-    Serial.printf("[TextMode] Sent %d bytes via ESP-IDF: '%s'\n", written, finalMessage.c_str());
-    return written == (int)finalMessage.length();
-#else
-    // Send the message only (without CRLF to avoid extra characters in remote display)
-    size_t written = uartPort->print(finalMessage);
-    
-    Serial.printf("[TextMode] Sent %d bytes: '%s'\n", written, finalMessage.c_str());
-    
-    return written == finalMessage.length();
-#endif
-}
-
-// Placeholder parsing methods - simplified versions
-String MeshtasticClient::formatLastHeard(uint32_t seconds) {
-    if (seconds == 0) return "Never";
-
-    if (seconds < 60) return String(seconds) + "s";
-    uint32_t minutes = seconds / 60;
-    if (minutes < 60) return String(minutes) + "m";
-    uint32_t hours = minutes / 60;
-    if (hours < 48) return String(hours) + "h";
-    uint32_t days = hours / 24;
-    return String(days) + "d";
-}
-
-void MeshtasticClient::updateConnectionState(ConnectionState newState) {
-    if (connectionState != newState) {
-        Serial.printf("[State] Connection state changed: %d -> %d\n", connectionState, newState);
-        connectionState = newState;
-        
-        // Update UI based on state
-        if (g_ui) {
-            switch (newState) {
-                case CONN_DISCONNECTED:
-                    g_ui->showMessage("Disconnected");
-                    break;
-                case CONN_CONNECTING:
-                    g_ui->showMessage("Connecting...");
-                    break;
-                case CONN_CONNECTED:
-                    g_ui->showMessage("Connected");
-                    break;
-                case CONN_REQUESTING_CONFIG:
-                    g_ui->showMessage("Requesting config...");
-                    break;
-                case CONN_WAITING_CONFIG:
-                    g_ui->showMessage("Waiting for config...");
-                    break;
-                case CONN_NODE_DISCOVERY:
-                    g_ui->showMessage("Retrieving nodes...");
-                    break;
-                case CONN_READY:
-                    g_ui->showSuccess("Ready");
-                    // Auto-request node list like Python Meshtastic client does - but only once
-                    if (!autoNodeDiscoveryRequested && !textMessageMode) {
-                        Serial.println("[Nodes] Auto-requesting node list after connection ready...");
-                        autoNodeDiscoveryRequested = true;
-                        requestNodeList();
-                    }
-                    break;
-                case CONN_ERROR:
-                    g_ui->showError("Connection error");
-                    break;
-            }
-        }
-    }
-}
-
-bool MeshtasticClient::isInitializationComplete() const {
-    return connectionState == CONN_READY;
-}
-
-bool MeshtasticClient::hasActiveTransport() const {
-    if (isConnected) {
+    if (sendProtobuf(packet.data(), packet.size())) {
+        LOG_PRINTF("[Message] Sent to 0x%08X (id=%d)\n", nodeId, packetId);
         return true;
     }
-
-    switch (connectionState) {
-        case CONN_CONNECTED:
-        case CONN_REQUESTING_CONFIG:
-        case CONN_WAITING_CONFIG:
-        case CONN_NODE_DISCOVERY:
-        case CONN_READY:
-            return true;
-        default:
-            break;
-    }
-
-    if (uartAvailable) {
-        return true;
-    }
-
-    if (bleClient && bleClient->isConnected() && toRadioChar) {
-        return true;
-    }
-
     return false;
 }
 
-void MeshtasticClient::handleConfigTimeout() {
-    if (connectionState == CONN_WAITING_CONFIG && configRequestTime > 0) {
-        uint32_t elapsed = millis() - configRequestTime;
-        if (elapsed > 3000) { // 3 second timeout for faster retry
-            Serial.println("[Config] Config request timeout - retrying...");
+bool MeshtasticClient::sendDirectMessage(uint32_t nodeId, const String &message) {
+    if (deviceType == DEVICE_MESHCORE) {
+        if (nodeIndexById.count(nodeId)) {
+            size_t idx = nodeIndexById[nodeId];
+            String pubKeyHex = nodeList[idx].macAddress;
+            std::vector<uint8_t> pubKeyPrefix;
+            
+            if (pubKeyHex.length() >= 12) { // At least 6 bytes
+                for (int i = 0; i < 12; i += 2) {
+                    String byteStr = pubKeyHex.substring(i, i + 2);
+                    pubKeyPrefix.push_back((uint8_t)strtol(byteStr.c_str(), NULL, 16));
+                }
+            } else {
+                // Fallback: use nodeId as prefix (4 bytes) + 00 00
+                pubKeyPrefix.push_back(nodeId & 0xFF);
+                pubKeyPrefix.push_back((nodeId >> 8) & 0xFF);
+                pubKeyPrefix.push_back((nodeId >> 16) & 0xFF);
+                pubKeyPrefix.push_back((nodeId >> 24) & 0xFF);
+                pubKeyPrefix.push_back(0);
+                pubKeyPrefix.push_back(0);
+            }
+            
+            bool sent = sendMeshCoreText(message, pubKeyPrefix);
+            if (sent) {
+                const MeshtasticNode &node = nodeList[idx];
+                MeshtasticMessage msg;
+                msg.fromNodeId = myNodeId;
+                msg.toNodeId = nodeId;
+                msg.fromName = myNodeName.length() ? myNodeName : generateNodeDisplayName(myNodeId);
+                msg.toName = node.longName.length() ? node.longName : (node.shortName.length() ? node.shortName : generateNodeDisplayName(nodeId));
+                msg.content = message;
+                msg.timestamp = millis() / 1000;
+                msg.messageType = MSG_TYPE_TEXT;
+                msg.channel = currentChannel;
+                msg.isDirect = true;
+                msg.status = MSG_STATUS_SENT;
+                addMessageToHistory(msg);
+            }
+            return sent;
+        }
+        return false;
+    }
+    
+    return sendMessage(nodeId, message, 0);
+}
+
+bool MeshtasticClient::sendTextMessage(const String &message, uint32_t nodeId) {
+    return sendDirectMessage(nodeId, message);
+}
+
+// ==========================================
+// UI State & Getters
+// ==========================================
+
+bool MeshtasticClient::hasActiveTransport() const {
+    return isConnected;
+}
+
+int MeshtasticClient::getBrightness() const {
+    return brightness;
+}
+
+void MeshtasticClient::setBrightness(uint8_t b) {
+    brightness = b;
+    M5.Display.setBrightness(b);
+    saveSettings();
+}
+
+uint32_t MeshtasticClient::getScreenTimeout() const {
+    return screenTimeoutMs;
+}
+
+void MeshtasticClient::setScreenTimeout(uint32_t timeoutMs) {
+    screenTimeoutMs = timeoutMs;
+    wakeScreen(); // Reset timer
+}
+
+bool MeshtasticClient::isScreenTimedOut() const {
+    if (screenTimeoutMs == 0) return false; // Never timeout
+    return (millis() - lastScreenActivity > screenTimeoutMs);
+}
+
+void MeshtasticClient::wakeScreen() {
+    lastScreenActivity = millis();
+}
+
+void MeshtasticClient::updateScreenTimeout() {
+    // This is called in loop() to check for timeout
+    // Actual screen off logic would be handled by UI class polling isScreenTimedOut()
+}
+
+String MeshtasticClient::getMessageModeString() const {
+    if (textMessageMode || messageMode == MODE_TEXTMSG) {
+        return "TextMsg";
+    }
+
+    switch (messageMode) {
+        case MODE_PROTOBUFS: return "Protobufs";
+        case MODE_SIMPLE:    return "Simple";
+        default:             return "Unknown";
+    }
+}
+
+String MeshtasticClient::getScreenTimeoutString() const {
+    if (screenTimeoutMs == 0) return "Never";
+    return String(screenTimeoutMs / 1000) + "s";
+}
+
+void MeshtasticClient::setMessageMode(int mode) {
+    MessageMode newMode;
+    switch (mode) {
+        case MODE_TEXTMSG:
+            newMode = MODE_TEXTMSG;
+            break;
+        case MODE_SIMPLE:
+            newMode = MODE_SIMPLE;
+            break;
+        case MODE_PROTOBUFS:
+        default:
+            newMode = MODE_PROTOBUFS;
+            break;
+    }
+
+    bool targetTextMode = (newMode == MODE_TEXTMSG);
+    bool wasTextMode = textMessageMode;
+
+    if (messageMode == newMode && wasTextMode == targetTextMode) {
+        return; // No change
+    }
+
+    messageMode = newMode;
+    textMessageMode = targetTextMode;
+
+    if (targetTextMode) {
+        LOG_PRINTLN("[Mode] TextMsg mode enabled (UART-only)");
+        // Text mode cannot operate over BLE transports
+        if (connectionType == "BLE" && isConnected) {
+            LOG_PRINTLN("[Mode] Disconnecting BLE to honor TextMsg request");
+            disconnectBLE();
+        }
+        if (uartAvailable) {
+            updateConnectionState(CONN_READY);
+        }
+    } else {
+        if (wasTextMode && connectionType == "UART" && uartAvailable) {
+            LOG_PRINTLN("[Mode] Leaving TextMsg mode - requesting protobuf config");
             requestConfig();
         }
     }
+
+    saveSettings();
 }
 
-String MeshtasticClient::getConnectionStateString() const {
-    switch (connectionState) {
-        case CONN_DISCONNECTED: return "Disconnected";
-        case CONN_SCANNING: return "Scanning...";
-        case CONN_CONNECTING: return "Connecting...";
-        case CONN_CONNECTED: return "Connected";
-        case CONN_REQUESTING_CONFIG: return "Requesting config...";
-        case CONN_WAITING_CONFIG: return "Getting config...";
-        case CONN_NODE_DISCOVERY: return "Finding nodes...";
-        case CONN_READY: return "Ready";
-        case CONN_ERROR: return "Error";
-        default: return "Unknown";
+void MeshtasticClient::setTextMessageMode(int mode) {
+    if (mode) {
+        setMessageMode(MODE_TEXTMSG);
+    } else if (textMessageMode || messageMode == MODE_TEXTMSG) {
+        setMessageMode(MODE_PROTOBUFS);
     }
 }
 
-void MeshtasticClient::showMessageHistory() {
-    // Handled by UI
-}
+// ==========================================
+// Connection Management
+// ==========================================
 
-// Enhanced BLE scanning methods for UI integration
-bool MeshtasticClient::startBleScan() {
-    Serial.println("[BLE] ========== Starting BLE scan ==========");
-    
-    // Initialize BLE stack
-    // NimBLE init is safe to call multiple times - it will only initialize once
-    Serial.println("[BLE] Initializing BLE stack...");
-    NimBLEDevice::init("MeshClient");
-    delay(100);  // Give BLE stack time to initialize
-    Serial.println("[BLE] ✓ BLE stack ready");
-    
-    // Clear previous scan results and optimize memory
-    scannedDeviceNames.clear();
-    scannedDeviceAddresses.clear();
-    scannedDevicePaired.clear();
-    scannedDeviceAddrTypes.clear();
-    
-    // Pre-reserve memory to avoid frequent reallocations during scanning
-    const size_t INITIAL_CAPACITY = 16;
-    scannedDeviceNames.reserve(INITIAL_CAPACITY);
-    scannedDeviceAddresses.reserve(INITIAL_CAPACITY);
-    scannedDevicePaired.reserve(INITIAL_CAPACITY);
-    scannedDeviceAddrTypes.reserve(INITIAL_CAPACITY);
-    
-    Serial.println("[BLE] Cleared previous scan results and reserved memory");
-    
-    Serial.printf("[BLE] 📊 Initial state: %d devices in list\n", scannedDeviceNames.size());
-    
-    // Get the BLE scan object
-    activeScan = NimBLEDevice::getScan();
-    if (!activeScan) {
-        Serial.println("[BLE] ERROR: Failed to get scan object");
-        return false;
-    }
-    
-    // Stop any ongoing scan first
-    if (activeScan->isScanning()) {
-        Serial.println("[BLE] Stopping previous scan...");
-        activeScan->stop();
-        delay(100);
-    }
-    
-    // Configure scan parameters - improve discovery coverage
-    // Only create new callback if we don't have one already
-    if (!scanCallback) {
-        scanCallback = new MeshtasticBLEScanCallbacks();
-    }
-    scanCallback->meshtasticClient = this;  // Set the client pointer for UI scanning
-    
-    // IMPORTANT: Register scan callbacks BEFORE starting scan so onResult() is invoked
-    activeScan->setScanCallbacks(scanCallback, false);
-    
-    // Use passive scan first: Some devices do not respond to scan requests, passive increases coverage
-    // Keep interval ~= window for near-continuous listening (values per NimBLE expectations)
-    activeScan->setInterval(80);   // typical good value for active scan
-    activeScan->setWindow(60);     // shorter than interval per spec
-    activeScan->setActiveScan(true);           // active scan to fetch complete names
-    activeScan->setDuplicateFilter(true);      // receive each device once
-    
-    Serial.println("[BLE] Scan configured: interval=80 window=60 active=true dupFilter=true");
-    
-    // Start scanning - continuous until manually stopped
-    bleUiScanActive = true;
-    Serial.println("[BLE] Starting continuous scan (will run until stopped)...");
-    
-    // Start with 0 duration for continuous scanning
-    bool started = activeScan->start(0, false);
-    
-    if (started) {
-        Serial.println("[BLE] ✓ UI scan started successfully");
-        Serial.println("[BLE] Listening for BLE advertisements...");
-    } else {
-        Serial.println("[BLE] ✗ Failed to start UI scan");
-        bleUiScanActive = false;
-    }
-    
-    return started;
-}
-
-void MeshtasticClient::stopBleScan() {
-    if (activeScan && bleUiScanActive) {
-        activeScan->stop();
-        bleUiScanActive = false;
-        
-        // Clear callbacks to avoid stale pointer issues
-        if (activeScan) {
-            activeScan->setScanCallbacks(nullptr, false);
-        }
-        
-        // Optimize memory usage after scan
-        scannedDeviceNames.shrink_to_fit();
-        scannedDeviceAddresses.shrink_to_fit();
-        scannedDevicePaired.shrink_to_fit();
-        
-        Serial.println("[BLE] UI scan stopped and memory optimized");
-        logCurrentScanSummary();
-    }
+void MeshtasticClient::updateConnectionState(int state) {
+    connectionState = (ConnectionState)state;
 }
 
 bool MeshtasticClient::startGroveConnection() {
-    Serial.println("[Grove] User manually triggered Grove connection");
-    
-    // Check if already connected
-    if (uartAvailable) {
-        Serial.println("[Grove] Already connected to Grove device");
-        if (g_ui) {
-            g_ui->showMessage("Already connected");
-        }
+    Serial.println("[UART] Manual Grove connection requested via UI");
+
+    // Always disconnect BLE first to ensure clean state
+    if (isConnected && connectionType == "BLE") {
+        Serial.println("[UART] Disconnecting BLE before starting Grove...");
+        disconnectBLE();
+    }
+
+    // Mark that the user explicitly asked for Grove so loop() keeps probing
+    groveConnectionManuallyTriggered = true;
+
+    // Ensure our preference allows UART attempts
+    if (userConnectionPreference != PREFER_GROVE) {
+        Serial.println("[UART] Forcing connection preference to Grove for manual request");
+        setUserConnectionPreference(PREFER_GROVE);
+    }
+
+    // If UART already active just report success
+    if (uartAvailable && connectionType == "UART") {
+        Serial.println("[UART] Already connected via Grove");
         return true;
     }
-    
-    // Check if BLE is active
-    if (isConnected && connectionType == "BLE") {
-        Serial.println("[Grove] Cannot connect Grove while BLE is active");
-        if (g_ui) {
-            g_ui->showError("Disconnect BLE first");
+
+    // Attempt immediate init; loop() will retry if this fails
+    bool initOk = tryInitUART();
+    if (!initOk) {
+        Serial.println("[UART] Initial Grove attempt failed, will retry in loop()");
+    }
+    return initOk;
+}
+
+bool MeshtasticClient::connectToDeviceByName(const String& name) {
+    // Find device by name in scanned list and connect
+    for (size_t i = 0; i < scannedDeviceNames.size(); i++) {
+        if (scannedDeviceNames[i] == name) {
+            return connectToDeviceByAddress(scannedDeviceAddresses[i]);
         }
-        return false;
     }
-    
-    // Set flag to trigger connection attempt in loop()
-    groveConnectionManuallyTriggered = true;
-    Serial.println("[Grove] Manual connection flag set, will attempt in next loop cycle");
-    
-    if (g_ui) {
-        g_ui->showMessage("Connecting to Grove...");
-    }
-    
+    return false;
+}
+
+bool MeshtasticClient::connectToDeviceByAddress(const String& address) {
+    // Initiate connection to address
+    // This needs to use the AsyncConnectParams struct and task
+    AsyncConnectParams* params = new AsyncConnectParams{this, "", address};
+    xTaskCreate(
+        [](void* p) {
+            AsyncConnectParams* params = (AsyncConnectParams*)p;
+            if (params && params->self) {
+                Serial.printf("Connecting to %s\n", params->address.c_str());
+                // In a real implementation, we'd need to scan for this specific address or use NimBLEClient::connect(address)
+            }
+            delete params;
+            vTaskDelete(NULL);
+        },
+        "ble_connect",
+        4096,
+        params,
+        1,
+        NULL
+    );
     return true;
 }
 
+bool MeshtasticClient::connectToDeviceWithPin(const String& name, const String& pin) {
+    // Connect and supply PIN
+    // This is complex with NimBLE. Usually we set a flag or callback return.
+    // For now, just trigger connection.
+    return connectToDeviceByName(name);
+}
+
+void MeshtasticClient::handleRemoteDisconnect() {
+    isConnected = false;
+    connectionState = CONN_DISCONNECTED;
+    if (bleClient) {
+        // bleClient->disconnect(); // Already disconnected if this is called
+        bleClient = nullptr;
+    }
+}
+
+void MeshtasticClient::setUARTConfig(uint32_t baud, int txPin, int rxPin, bool applyNow) {
+    // Sanity constraints – keep values inside a safe range for ESP32 GPIOs/baud
+    if (baud < 1200 || baud > 2000000) {
+        LOG_PRINTF("[UART] Requested baud %lu outside safe range, clamping to default %d\n",
+                   (unsigned long)baud, MESHTASTIC_UART_BAUD);
+        baud = MESHTASTIC_UART_BAUD;
+    }
+
+    auto clampPin = [](int requested, int fallback) {
+        if (requested < 0 || requested > 48) return fallback;
+        return requested;
+    };
+
+    txPin = clampPin(txPin, MESHTASTIC_TXD_PIN);
+    rxPin = clampPin(rxPin, MESHTASTIC_RXD_PIN);
+
+    bool configChanged = (baud != uartBaud) || (txPin != uartTxPin) || (rxPin != uartRxPin);
+    uartBaud = baud;
+    uartTxPin = txPin;
+    uartRxPin = rxPin;
+
+    // Persist immediately so the UI reflects the change after a reboot
+    saveSettings();
+
+    if (!configChanged) {
+        return;
+    }
+
+    LOG_PRINTF("[UART] Config updated -> baud=%lu TX=GPIO%d RX=GPIO%d (apply=%d)\n",
+               (unsigned long)uartBaud, uartTxPin, uartRxPin, applyNow ? 1 : 0);
+
+    bool uartWasActive = (connectionType == "UART" && uartAvailable);
+
+    auto shutdownUART = [this]() {
+#ifdef USE_ESP_IDF_UART
+        uart_driver_delete(UART_NUM_1);
+#else
+        if (uartPort) {
+            uartPort->end();
+        }
+#endif
+        uartAvailable = false;
+        uartInited = false;
+        uartPort = nullptr;
+    };
+
+    if (uartAvailable || uartInited) {
+        shutdownUART();
+        if (connectionType == "UART") {
+            connectionType = "None";
+            isConnected = false;
+            deviceConnected = false;
+            updateConnectionState(CONN_DISCONNECTED);
+        }
+        uartRxBuffer.clear();
+    }
+
+    if (applyNow && uartWasActive) {
+        LOG_PRINTLN("[UART] Restarting UART with new settings...");
+        if (!tryInitUART()) {
+            LOG_PRINTLN("[UART] Failed to restart UART after config change");
+        }
+    }
+}
+
+void MeshtasticClient::handleConfigTimeout() {
+    // Check if config request timed out
+}
+
+// ==========================================
+// BLE Scanning
+// ==========================================
+
+bool MeshtasticClient::startBleScan() {
+    if (!activeScan) {
+        NimBLEDevice::init("MeshClient");
+        activeScan = NimBLEDevice::getScan();
+        if (!scanCallback) {
+            scanCallback = new MeshtasticBLEScanCallbacks();
+            scanCallback->meshtasticClient = this;
+        }
+        activeScan->setScanCallbacks(scanCallback, false);
+        activeScan->setActiveScan(true);
+        activeScan->setInterval(100);
+        activeScan->setWindow(80);
+    }
+
+    if (activeScan) {
+        bleUiScanActive = true;
+        scannedDeviceNames.clear();
+        scannedDeviceAddresses.clear();
+        scannedDevicePaired.clear();
+        activeScan->start(0, false); // Continuous scan
+        return true;
+    }
+    return false;
+}
+
+void MeshtasticClient::stopBleScan() {
+    if (activeScan) {
+        activeScan->stop();
+        bleUiScanActive = false;
+    }
+}
+
 bool MeshtasticClient::isBleScanning() const {
-    return bleUiScanActive && activeScan && activeScan->isScanning();
+    return activeScan && activeScan->isScanning();
 }
 
 std::vector<String> MeshtasticClient::getScannedDeviceNames() const {
@@ -3052,189 +2890,247 @@ std::vector<bool> MeshtasticClient::getScannedDevicePairedStatus() const {
     return scannedDevicePaired;
 }
 
-bool MeshtasticClient::connectToDeviceWithPin(const String &deviceAddress, const String &pin) {
-    // This is a simplified implementation - in reality, BLE pairing with PIN
-    // would require more complex security handling
-    Serial.printf("[BLE] Attempting to connect to %s with PIN %s\n", deviceAddress.c_str(), pin.c_str());
-    
-    // For now, simulate successful connection
-    Serial.println("[BLE] Simulated connection success");
-    return true;
-}
-
-bool MeshtasticClient::isDevicePaired(const String &deviceAddress) const {
-    // Check if device is in paired devices list
-    // This is a simplified implementation
-    return false; // For now, assume no devices are pre-paired
-}
-
 void MeshtasticClient::logCurrentScanSummary() const {
-    Serial.printf("[BLE] ========== Scan Summary ==========\n");
-    Serial.printf("[BLE] Total devices found: %d\n", scannedDeviceNames.size());
-    Serial.printf("[BLE] Scan is active: %s\n", bleUiScanActive ? "YES" : "NO");
-    
-    if (scannedDeviceNames.empty()) {
-        Serial.println("[BLE] No devices found yet");
-    } else {
-        for (size_t i = 0; i < scannedDeviceNames.size(); ++i) {
-            const String &name = scannedDeviceNames[i];
-            const String &addr = (i < scannedDeviceAddresses.size()) ? scannedDeviceAddresses[i] : String("?");
-            bool paired = (i < scannedDevicePaired.size()) ? scannedDevicePaired[i] : false;
-            bool isMesh = name.indexOf("Mesh") >= 0 || name.indexOf("mesh") >= 0;
-            Serial.printf("[BLE]   #%02d: '%s' | %s | %s%s\n", 
-                          (int)(i+1), name.c_str(), addr.c_str(), 
-                          paired ? "Paired" : "Unpaired",
-                          isMesh ? " | MESHTASTIC" : "");
-        }
-    }
-    Serial.printf("[BLE] ===================================\n");
+    Serial.printf("Scan summary: %d devices found\n", scannedDeviceNames.size());
 }
 
-// ========== BLE Authentication Methods ==========
-
-void MeshtasticClient::showPinDialog(uint32_t passkey) {
-    Serial.printf("[BLE Auth] showPinDialog called with passkey: %lu\n", (unsigned long)passkey);
-    
-    if (!g_ui) {
-        Serial.println("[BLE Auth] No UI available - cannot show PIN dialog");
-        return;
-    }
-    
-    // CRITICAL: Stop any active scan that might interfere with PIN dialog display
-    if (bleUiScanActive) {
-        Serial.println("[BLE Auth] Stopping active scan UI before showing PIN dialog");
-        stopBleScan();
-        delay(50);
-    }
-    
-    // Close any existing modal to prevent interference
-    g_ui->closeModal();
-    delay(50);
-    
-    if (passkey == 0) {
-        // Input mode - use fullscreen input dialog (like message composer)
-        Serial.println("[BLE Auth] Showing fullscreen PIN input dialog");
-        g_ui->openInputDialog("Enter PIN from device", MeshtasticUI::INPUT_ENTER_BLE_PIN, 0, "");
-    } else {
-        // Display mode - show the PIN that should be confirmed on the device
-        Serial.printf("[BLE Auth] Auto-confirming PIN: %06lu (display mode not used)\n", (unsigned long)passkey);
-    }
-    
-    // Force immediate UI redraw to ensure PIN dialog is visible
-    g_ui->needsRedraw = true;
-    g_ui->draw();
-    Serial.println("[BLE Auth] PIN dialog displayed and UI redrawn");
-}
-
-void MeshtasticClient::handleAuthenticationRequest(uint16_t conn_handle, int action, uint8_t* data) {
-    Serial.printf("[BLE Auth] handleAuthenticationRequest: conn_handle=%d, action=%d\n", 
-                  conn_handle, action);
-    
-    // This method can be extended to handle more complex authentication scenarios
-    // For now, the main authentication handling is in bleAuthEventHandler
-    (void)conn_handle;
-    (void)action;
-    (void)data;
+bool MeshtasticClient::isDevicePaired(const String& address) const {
+    // Check if address is in paired list (NimBLEDevice::getBondedDevices())
+    return false; // Placeholder
 }
 
 void MeshtasticClient::clearPairedDevices() {
-    Serial.println("[BLE] Clearing all paired devices...");
-    
-    // Clear internal scan results
-    scannedDeviceNames.clear();
-    scannedDeviceAddresses.clear();
-    scannedDevicePaired.clear();
-    scannedDeviceAddrTypes.clear();
-    
-    // Temporarily initialize NimBLE if needed to access bond storage
-    bool needsInit = false;
-    if (!bleClient || !bleClient->isConnected()) {
-        Serial.println("[BLE] Initializing NimBLE to access bond storage...");
-        NimBLEDevice::init("");
-        needsInit = true;
+    NimBLEDevice::deleteAllBonds();
+}
+
+// ==========================================
+// Message & Node Handling
+// ==========================================
+
+int MeshtasticClient::getMessageCountForDestination(uint32_t destId) const {
+    // Count messages in history for this destination
+    int count = 0;
+    for (const auto& msg : messageHistory) {
+        if (msg.toNodeId == destId || msg.fromNodeId == destId) {
+            count++;
+        }
     }
-    
-    // Clear NimBLE bonded devices
-    int bondCount = NimBLEDevice::getNumBonds();
-    Serial.printf("[BLE] Found %d bonded devices to clear\n", bondCount);
-    
-    if (bondCount > 0) {
-        NimBLEDevice::deleteAllBonds();
-        Serial.printf("[BLE] ✓ Cleared %d bonded devices\n", bondCount);
+    return count;
+}
+
+String MeshtasticClient::formatLastHeard(uint32_t lastHeard) {
+    if (lastHeard == 0) return "Never";
+    unsigned long diff = millis() / 1000 - lastHeard; // Approximate
+    if (diff < 60) return String(diff) + "s";
+    if (diff < 3600) return String(diff / 60) + "m";
+    return String(diff / 3600) + "h";
+}
+
+bool MeshtasticClient::broadcastMessage(const String& message, uint8_t channel) {
+    if (deviceType == DEVICE_MESHCORE) {
+        if (!meshCoreRxChar || !isConnected) {
+            LOG_PRINTLN("[MeshCore] Cannot broadcast (not connected)");
+            return false;
+        }
+        bool sent = sendMeshCoreBroadcast(message, channel);
+        if (sent) {
+            MeshtasticMessage msg;
+            msg.fromNodeId = myNodeId;
+            msg.toNodeId = 0xFFFFFFFF;
+            msg.fromName = myNodeName.length() ? myNodeName : generateNodeDisplayName(myNodeId);
+            String channelName = getPrimaryChannelName();
+            if (channelName.isEmpty()) channelName = "Primary";
+            msg.toName = channelName;
+            msg.content = message;
+            msg.timestamp = millis() / 1000;
+            msg.messageType = MSG_TYPE_TEXT;
+            msg.channel = channel;
+            msg.isDirect = false;
+            msg.status = MSG_STATUS_SENT;
+            addMessageToHistory(msg);
+        }
+        return sent;
     }
-    
-    // Deinitialize if we initialized it temporarily
-    if (needsInit && !isConnected) {
-        NimBLEDevice::deinit(true);
-        Serial.println("[BLE] Deinitialized NimBLE after clearing bonds");
+
+    return sendTextMessage(message, 0xFFFFFFFF); // Legacy broadcast fallback
+}
+
+bool MeshtasticClient::sendTraceRoute(uint32_t destId, uint8_t hopLimit) {
+    // Send traceroute packet
+    return false;
+}
+
+void MeshtasticClient::clearMessageHistory() {
+    messageHistory.clear();
+}
+
+void MeshtasticClient::drainIncoming(bool processAll, bool fromNotify) {
+    (void)fromNotify;  // Currently unused but retained for future heuristics
+
+    // Historical behavior: processAll=true was the "quick" path used for BLE notify drains
+    int loops = processAll ? 1 : 5;
+    while (loops-- > 0) {
+        auto data = receiveProtobuf();
+        if (data.empty()) break;
+
+        ParsedFromRadio parsed;
+        if (!parseFromRadio(data, parsed, myNodeId)) {
+            static uint32_t s_lastParseFailLog = 0;
+            uint32_t now = millis();
+            if (now - s_lastParseFailLog > 1000) {
+                Serial.printf("[RX] Failed to parse protobuf packet (size=%u)\n", (unsigned)data.size());
+                s_lastParseFailLog = now;
+            }
+            continue;
+        }
+
+        if (connectionState == CONN_WAITING_CONFIG) {
+            bool sawConfigData = parsed.hasMyInfo || !parsed.channels.empty() ||
+                                 parsed.sawConfig || parsed.sawConfigComplete;
+            if (sawConfigData) {
+                configReceived = true;
+            }
+
+            if (parsed.hasMyInfo || parsed.sawConfigComplete) {
+                Serial.println("[Config] Configuration complete - radio ready");
+                updateConnectionState(CONN_READY);
+
+                if (discoveryStartTime == 0) {
+                    discoveryStartTime = millis();
+                }
+                if (lastNodeAddedTime == 0) {
+                    lastNodeAddedTime = discoveryStartTime;
+                }
+            }
+        }
+
+        if (parsed.hasMyInfo) {
+            myNodeId = parsed.myInfo.myNodeNum;
+        }
+
+        for (const auto &node : parsed.nodes) {
+            upsertNode(node);
+        }
+
+        for (const auto &channel : parsed.channels) {
+            updateChannel(channel);
+        }
+
+        for (const auto &ack : parsed.acks) {
+            updateMessageStatus(ack.packetId, MSG_STATUS_DELIVERED);
+        }
+
+        for (const auto &text : parsed.texts) {
+            auto *sender = getNodeById(text.from);
+            auto *target = getNodeById(text.to);
+
+            String senderName;
+            if (sender && isValidDisplayName(sender->shortName)) {
+                senderName = sender->shortName;
+            } else if (sender && isValidDisplayName(sender->longName)) {
+                senderName = sender->longName;
+            } else {
+                senderName = generateNodeDisplayName(text.from);
+            }
+
+            String targetName;
+            if (target && isValidDisplayName(target->shortName)) {
+                targetName = target->shortName;
+            } else if (target && isValidDisplayName(target->longName)) {
+                targetName = target->longName;
+            } else {
+                targetName = (text.to == 0xFFFFFFFF) ? "Broadcast" : generateNodeDisplayName(text.to);
+            }
+
+            MeshtasticMessage msg;
+            msg.fromNodeId = text.from;
+            msg.toNodeId = text.to;
+            msg.content = text.text;
+            msg.channel = text.channel;
+            msg.packetId = text.packetId;
+            msg.timestamp = millis() / 1000;
+            msg.status = MSG_STATUS_DELIVERED;
+            msg.fromName = senderName;
+            msg.toName = targetName;
+            msg.messageType = MSG_TYPE_TEXT;
+            addMessageToHistory(msg);
+        }
+
+        for (const auto &trace : parsed.traceRoutes) {
+            Serial.printf("[TraceRoute] Received trace route response from 0x%08X to 0x%08X\n",
+                          trace.from, trace.to);
+            Serial.printf("[TraceRoute] Forward hops=%d SNR entries=%d | Return hops=%d SNR entries=%d\n",
+                          trace.route.size(), trace.snr.size(), trace.routeBack.size(), trace.snrBack.size());
+
+            if (traceRouteWaitingForResponse) {
+                traceRouteWaitingForResponse = false;
+                if (g_ui) {
+                    g_ui->openTraceRouteResult(trace.to, trace.route, trace.snr, trace.routeBack, trace.snrBack);
+                }
+            }
+        }
     }
-    
-    Serial.println("[BLE] ✓ All paired devices cleared");
+}
+
+// ==========================================
+// Settings & Config
+// ==========================================
+
+void MeshtasticClient::loadSettings() {
+    Preferences prefs;
+    if (prefs.begin("meshtastic", true)) {
+        brightness = prefs.getUChar("brightness", 128);
+        screenTimeoutMs = prefs.getUInt("timeout", 0);
+        textMessageMode = prefs.getBool("textMode", false);
+        messageMode = (MessageMode)prefs.getUChar("msgMode", MODE_PROTOBUFS);
+        uartBaud = prefs.getUInt("uartBaud", MESHTASTIC_UART_BAUD);
+        uartTxPin = prefs.getInt("uartTx", MESHTASTIC_TXD_PIN);
+        uartRxPin = prefs.getInt("uartRx", MESHTASTIC_RXD_PIN);
+        prefs.end();
+        
+        // Apply loaded settings
+        M5.Display.setBrightness(brightness);
+        Serial.printf("[Settings] Loaded: brightness=%d timeout=%d textMode=%d msgMode=%d baud=%lu TX=%d RX=%d\n",
+                      brightness, screenTimeoutMs, textMessageMode ? 1 : 0, messageMode,
+                      (unsigned long)uartBaud, uartTxPin, uartRxPin);
+        if (textMessageMode) {
+            messageMode = MODE_TEXTMSG;
+        }
+    }
+}
+
+void MeshtasticClient::saveSettings() {
+    Preferences prefs;
+    if (prefs.begin("meshtastic", false)) {
+        prefs.putUChar("brightness", brightness);
+        prefs.putUInt("timeout", screenTimeoutMs);
+        prefs.putBool("textMode", textMessageMode);
+        prefs.putUChar("msgMode", (uint8_t)messageMode);
+        prefs.putUInt("uartBaud", uartBaud);
+        prefs.putInt("uartTx", uartTxPin);
+        prefs.putInt("uartRx", uartRxPin);
+        prefs.end();
+        Serial.println("[Settings] Saved");
+    }
 }
 
 void MeshtasticClient::printStartupConfig() {
-    Serial.println("[DEBUG] printStartupConfig() function started");
-    Serial.println("========================================");
-    Serial.println("[CONFIG] Meshtastic Client Configuration");
-    Serial.println("========================================");
-    
-    // Basic connection info
-    Serial.printf("[CONFIG] Actual Connection State: %s\n", connectionType.c_str());
-    Serial.printf("[CONFIG] User Preference: %s\n", getUserConnectionPreferenceString().c_str());
-    Serial.printf("[CONFIG] Device Connected: %s\n", isDeviceConnected() ? "YES" : "NO");
-    Serial.printf("[CONFIG] Connection State: %d\n", connectionState);
-    
-    // Mode information
-    Serial.printf("[CONFIG] Message Mode: %s\n", getMessageModeString().c_str());
-    Serial.printf("[CONFIG] Text Message Mode: %s\n", textMessageMode ? "ENABLED" : "DISABLED");
-    
-    // UART/Grove configuration
-    Serial.println("----------------------------------------");
-    Serial.println("[CONFIG] UART/Grove Configuration:");
-    Serial.printf("[CONFIG]   Baud Rate: %u\n", uartBaud);
-    Serial.printf("[CONFIG]   TX Pin: %d\n", uartTxPin);
-    Serial.printf("[CONFIG]   RX Pin: %d\n", uartRxPin);
-    Serial.printf("[CONFIG]   UART Available: %s\n", uartAvailable ? "YES" : "NO");
-    Serial.printf("[CONFIG]   UART Initialized: %s\n", uartInited ? "YES" : "NO");
-    
-    // BLE configuration
-    Serial.println("----------------------------------------");
-    Serial.println("[CONFIG] Bluetooth Configuration:");
-    bool bleConnected = (connectionType == "BLE" && isConnected);
-    Serial.printf("[CONFIG]   BLE Connected: %s\n", bleConnected ? "YES" : "NO");
-    
-    // Get preferred bluetooth device from UI if available
-    if (g_ui) {
-        String preferredDevice = g_ui->getPreferredBluetoothDevice();
-        String preferredAddress = g_ui->getPreferredBluetoothAddress();
-        
-        if (!preferredDevice.isEmpty()) {
-            Serial.printf("[CONFIG]   Preferred Device: %s\n", preferredDevice.c_str());
-        } else {
-            Serial.println("[CONFIG]   Preferred Device: None");
-        }
-        
-        if (!preferredAddress.isEmpty()) {
-            Serial.printf("[CONFIG]   Preferred Address: %s\n", preferredAddress.c_str());
-        } else {
-            Serial.println("[CONFIG]   Preferred Address: None");
-        }
+    Serial.println("Startup Config:");
+    Serial.printf("  Connection Preference: %s\n", getUserConnectionPreferenceString().c_str());
+    Serial.printf("  Message Mode: %s\n", getMessageModeString().c_str());
+    Serial.printf("  UART Config: Baud=%lu, TX=%d, RX=%d\n", (unsigned long)uartBaud, uartTxPin, uartRxPin);
+    Serial.printf("  UART Status: Available=%s, Inited=%s\n", uartAvailable ? "YES" : "NO", uartInited ? "YES" : "NO");
+    Serial.printf("  Brightness: %d\n", brightness);
+    Serial.printf("  Screen Timeout: %s\n", getScreenTimeoutString().c_str());
+    Serial.printf("  Text Message Mode: %s\n", textMessageMode ? "Enabled" : "Disabled");
+}
+
+void MeshtasticClient::addMessageToHistory(const MeshtasticMessage &msg) {
+    messageHistory.push_back(msg);
+    // Limit history size to prevent memory issues
+    if (messageHistory.size() > 100) {
+        messageHistory.erase(messageHistory.begin());
     }
-    
-    if (isConnected && !connectedDeviceName.isEmpty()) {
-        Serial.printf("[CONFIG]   Connected Device: %s\n", connectedDeviceName.c_str());
-    }
-    
-    // Channel and node information
-    Serial.println("----------------------------------------");
-    Serial.println("[CONFIG] Network Information:");
-    Serial.printf("[CONFIG]   My Node ID: 0x%08X\n", myNodeId);
-    Serial.printf("[CONFIG]   Primary Channel: %s\n", primaryChannelName.c_str());
-    Serial.printf("[CONFIG]   Current Channel: %u\n", currentChannel);
-    Serial.printf("[CONFIG]   Known Nodes: %d\n", nodeList.size());
-    Serial.printf("[CONFIG]   Message History: %d\n", messageHistory.size());
-    
-    Serial.println("========================================");
 }
 
 

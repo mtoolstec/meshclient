@@ -1141,16 +1141,15 @@ void MeshtasticUI::showNodesTab() {
 	// Calculate layout dimensions
 	int screenWidth = M5.Lcd.width();
 	int screenHeight = M5.Lcd.height();
-	// Calculate actual available height from current Y position to bottom content area (above tab bar)
-	int availableHeight = screenHeight - y - TAB_BAR_HEIGHT; // stop above tab bar to avoid overlap
-	// Make left list narrower: use half of the original width
-	int baseLeftWidth = screenWidth / 2 - 15; // original
-	int leftColumnWidth = std::max(60, baseLeftWidth / 2); // keep a reasonable minimum
-	int rightColumnX = leftColumnWidth + 15;
+	int availableHeight = screenHeight - y - TAB_BAR_HEIGHT;
+	int totalContentWidth = screenWidth - (BORDER_PAD * 2);
+	int leftColumnWidth = std::max(120, totalContentWidth / 2);
+	int dividerX = BORDER_PAD + leftColumnWidth + 5;
+	int rightColumnX = dividerX + 5;
 	int rightColumnWidth = screenWidth - rightColumnX - BORDER_PAD;
 
 	// Draw vertical separator (end above tab bar)
-	M5.Lcd.drawLine(leftColumnWidth + 10, y - 4, leftColumnWidth + 10, screenHeight - TAB_BAR_HEIGHT, DARKGREY);
+	M5.Lcd.drawLine(dividerX, y - 4, dividerX, screenHeight - TAB_BAR_HEIGHT, DARKGREY);
 
 	// Calculate node list display parameters
 	int lineHeight = 16; // Reduce line height from 18 to 16 for more nodes
@@ -1214,7 +1213,7 @@ void MeshtasticUI::showNodesTab() {
 
 	// Draw scrollbar if needed
 	if (needsScrollbar) {
-		int scrollbarX = leftColumnWidth + 5;
+		int scrollbarX = dividerX - 5;
 		int scrollbarY = y;
 		// Fix scrollbar height to extend to bottom of screen minus tab bar
 		int scrollbarHeight = screenHeight - scrollbarY - TAB_BAR_HEIGHT;
@@ -1245,7 +1244,7 @@ void MeshtasticUI::showNodesTab() {
 			String fullName = selectedNode->longName.length() ? selectedNode->longName : selectedNode->shortName;
 			if (fullName.isEmpty()) {
 				String fullHex = String(selectedNode->nodeId, HEX);
-				fullName = "Meshtastic_" + (fullHex.length() > 4 ? fullHex.substring(fullHex.length() - 4) : fullHex);
+				fullName = (fullHex.length() > 4 ? fullHex.substring(fullHex.length() - 4) : fullHex);
 			}
 			drawText("Name:", rightColumnX, detailY);
 			drawText(fullName, rightColumnX, detailY + 12);
@@ -2179,6 +2178,12 @@ void MeshtasticUI::openNodeActionMenu() {
 	modalTitle = "Node Actions";
 	modalItems.clear();
 	modalItems.push_back("Send Message");
+
+	// Add Ping Repeater for MeshCore devices
+	if (client && client->getDeviceType() == DEVICE_MESHCORE) {
+		modalItems.push_back("Ping Repeater");
+	}
+
 	modalItems.push_back("Trace Route");
 	modalItems.push_back("Add to Favorite");
 	modalItems.push_back("Delete");
@@ -2636,7 +2641,7 @@ bool MeshtasticUI::performPendingInputAction() {
 						}
 					} else {
 						String fullHex = String(pendingNodeId, HEX);
-						currentDestinationName = "Meshtastic_" + (fullHex.length() > 4 ? fullHex.substring(fullHex.length() - 4) : fullHex);
+						currentDestinationName = (fullHex.length() > 4 ? fullHex.substring(fullHex.length() - 4) : fullHex);
 					}
 				} else {
 					String channelName = client ? client->getPrimaryChannelName() : "Primary";
@@ -2742,6 +2747,9 @@ void MeshtasticUI::handleModalSelection() {
 			if (choice == "Send Message") {
 				openMessageComposer(nodeId);
 				return;
+			} else if (choice == "Ping Repeater") {
+				client->sendMeshCorePing(nodeId);
+				showMessage("Ping sent to " + String(nodeId, HEX));
 			} else if (choice == "Trace Route") {
 				client->sendTraceRoute(nodeId, 5); // Default hop limit of 5
 				showMessage("Trace route sent");
@@ -2915,7 +2923,7 @@ void MeshtasticUI::handleModalSelection() {
 						}
 					} else {
 						String fullHex = String(selectedNodeId, HEX);
-						currentDestinationName = "Meshtastic_" + (fullHex.length() > 4 ? fullHex.substring(fullHex.length() - 4) : fullHex);
+						currentDestinationName = (fullHex.length() > 4 ? fullHex.substring(fullHex.length() - 4) : fullHex);
 					}
 				}
 				
@@ -3176,8 +3184,10 @@ void MeshtasticUI::handleModalSelection() {
 				break;
 			} else if (choice == "Connect via Grove") {
 				// This option only appears in Grove mode
-				showMessage("Please connect Grove UART device");
 				closeModal();
+				if (client) {
+					client->startGroveConnection();
+				}
 				break;
 			} else if (choice == "Search Device") {
 				// This option only appears in Bluetooth mode

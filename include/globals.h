@@ -33,6 +33,11 @@
 #define TO_RADIO_CHAR_UUID "f75c76d2-129e-4dad-a1dd-7866124401e7"
 #define FROM_NUM_CHAR_UUID "ed9da18c-a800-4f66-a670-aa7547e34453"
 
+// MeshCore BLE Service UUIDs (Nordic UART Service)
+#define MESHCORE_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define MESHCORE_RX_CHAR_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" // Write
+#define MESHCORE_TX_CHAR_UUID "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" // Notify
+
 // 全局变量声明
 extern bool deviceConnected;
 extern String connectionType;

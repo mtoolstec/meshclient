@@ -35,7 +35,7 @@ class MeshtasticClient;
 #define TFT_ORANGE 0xFD20
 
 // About Us text definition
-#define ABOUT_TEXT "MeshClient by MTools Tec. Provides BLE and UART connectivity for Meshtastic nodes."
+#define ABOUT_TEXT "MeshClient by MTools Tec. Provides BLE and UART connectivity for Meshtastic and MeshCore nodes."
 
 #define BUILD_VERSION "1.0.1"
 
