@@ -2540,10 +2540,11 @@ void MeshtasticUI::openMessageDetail(const String &from, const String &content) 
 	modalType = 6;  // Message detail view
 	modalContext = MODAL_MESSAGE_DETAIL;
 	// Ensure we don't accidentally duplicate the 'From:' prefix
-	if (from.startsWith("From:")) {
-		modalTitle = from;
+	String displayFrom = from.isEmpty() ? String("Message") : from;
+	if (displayFrom.startsWith("From:")) {
+		modalTitle = displayFrom;
 	} else {
-		modalTitle = "From: " + from;
+		modalTitle = "From: " + displayFrom;
 	}
 	fullMessageContent = content;
 	scrollOffset = 0; // Reset scroll position
@@ -2862,7 +2863,11 @@ void MeshtasticUI::handleModalSelection() {
 				auto filteredMessages = getFilteredMessages();
 				if (messageSelectedIndex >= 0 && messageSelectedIndex < (int)filteredMessages.size()) {
 					const auto &msg = filteredMessages[messageSelectedIndex];
-					openMessageDetail(msg.fromName, msg.content); // pass raw name (avoid double 'From:')
+					String detailFrom = msg.fromName;
+					if (client && client->getDeviceType() == DEVICE_MESHCORE && msg.fromNodeId == 0xFFFFFFFF) {
+						detailFrom = ""; // Suppress channel name for MeshCore broadcast messages
+					}
+					openMessageDetail(detailFrom, msg.content);
 					return;
 				}
 			} else if (choice == "Clear All") {
@@ -2945,7 +2950,11 @@ void MeshtasticUI::handleModalSelection() {
 				auto filteredMessages = getFilteredMessages();
 				if (messageSelectedIndex >= 0 && messageSelectedIndex < (int)filteredMessages.size()) {
 					const auto &msg = filteredMessages[messageSelectedIndex];
-					openMessageDetail(msg.fromName, msg.content);
+					String detailFrom = msg.fromName;
+					if (client && client->getDeviceType() == DEVICE_MESHCORE && msg.fromNodeId == 0xFFFFFFFF) {
+						detailFrom = ""; // Suppress channel name for MeshCore broadcast messages
+					}
+					openMessageDetail(detailFrom, msg.content);
 					return;
 				}
 			} else if (choice == "Clear All") {
@@ -3486,7 +3495,11 @@ void MeshtasticUI::updateVisibleMessages() {
 	
 	for (int i = total - 1; i >= 0; i--) {
 		const auto &msg = messages[i];
-		String fullText = msg.fromName + ": " + msg.content;
+		const bool isMeshCoreBroadcast = client &&
+			(client->getDeviceType() == DEVICE_MESHCORE) &&
+			(msg.fromNodeId == 0xFFFFFFFF);
+		String prefix = isMeshCoreBroadcast ? String("") : msg.fromName;
+		String fullText = prefix.isEmpty() ? msg.content : prefix + ": " + msg.content;
 		
 		// Calculate how many lines this message will take
 		String remaining = fullText;
@@ -3917,6 +3930,12 @@ void MeshtasticUI::openNewMessagePopup(const String &fromName, const String &con
 			const auto &latest = all.back();
 			popupFrom = latest.fromName;
 			popupContent = latest.content;
+
+			// For MeshCore broadcast messages, the channel name (e.g., Primary)
+			// is already embedded in the message text, so skip prefixing it.
+			if (latest.fromNodeId == 0xFFFFFFFF && client->getDeviceType() == DEVICE_MESHCORE) {
+				popupFrom = "";
+			}
 		}
 	}
 
@@ -3949,7 +3968,7 @@ void MeshtasticUI::openNewMessagePopup(const String &fromName, const String &con
 	}
 
 	// Otherwise, show a transient info overlay (centered message)
-	String popupMessage = popupFrom + ": " + popupContent;
+	String popupMessage = popupFrom.isEmpty() ? popupContent : popupFrom + ": " + popupContent;
 	displayInfo(popupMessage);
 	needsRedraw = true;
 }
@@ -4490,11 +4509,20 @@ void MeshtasticUI::showMessagesForDestination() {
 	std::vector<String> lineTexts(filteredMessages.size());
 	for (size_t i = 0; i < filteredMessages.size(); ++i) {
 		const auto &msg = filteredMessages[i];
-		String senderLabel = msg.fromName;
-		if (msg.fromNodeId != 0xFFFFFFFF) {
-			senderLabel = formatId(msg.fromNodeId);
+		const bool isMeshCoreBroadcast = client &&
+			(client->getDeviceType() == DEVICE_MESHCORE) &&
+			(msg.fromNodeId == 0xFFFFFFFF);
+
+		String senderLabel;
+		if (!isMeshCoreBroadcast) {
+			if (msg.fromNodeId != 0xFFFFFFFF) {
+				senderLabel = formatId(msg.fromNodeId);
+			} else {
+				senderLabel = msg.fromName;
+			}
 		}
-		String text = senderLabel + ": " + msg.content;
+
+		String text = senderLabel.isEmpty() ? msg.content : senderLabel + ": " + msg.content;
 		// Truncate to one line with ellipsis based on char estimate
 		if ((int)text.length() > maxCharsPerLine) {
 			messageTruncated[i] = true;
