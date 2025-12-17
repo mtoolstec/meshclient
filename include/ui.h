@@ -37,7 +37,7 @@ class MeshtasticClient;
 // About Us text definition
 #define ABOUT_TEXT "MeshClient by MTools Tec. Provides BLE and UART connectivity for Meshtastic and MeshCore nodes."
 
-#define BUILD_VERSION "1.0.1"
+#define BUILD_VERSION "1.1.0"
 
 #define BUILD_DATE __DATE__
 

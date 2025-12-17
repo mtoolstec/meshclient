@@ -119,11 +119,21 @@ constexpr uint32_t UART_PROBE_INTERVAL_MS = 3000;
 constexpr size_t MAX_HISTORY_MESSAGES = 80;
 constexpr size_t MAX_UART_FRAME = 512;
 
+// Format node IDs with fixed width (used for UI-friendly short/long IDs)
+String formatNodeIdHex(uint32_t nodeId, uint8_t width) {
+    char buffer[9]; // Max width of 8 + null terminator
+    snprintf(buffer, sizeof(buffer), "%0*X", width, nodeId);
+    return String(buffer);
+}
+
 // Generate a fallback display name from node ID (last 4 hex digits)
 String generateNodeDisplayName(uint32_t nodeId) {
-    char buffer[5]; // 4 chars + null terminator
-    snprintf(buffer, sizeof(buffer), "%04x", nodeId & 0xFFFF);
-    return String(buffer);
+    return formatNodeIdHex(nodeId & 0xFFFF, 4);
+}
+
+// MeshCore uses full 8-digit IDs in UI
+String formatMeshCoreNodeId(uint32_t nodeId) {
+    return formatNodeIdHex(nodeId, 8);
 }
 }
 
@@ -1366,9 +1376,10 @@ void MeshtasticClient::onMeshCoreNotify(uint8_t *data, size_t length) {
                  nodeInfo.user.longName = String(nameBuf);
                  // If name is empty, use Node ID as name, but don't prefix with "Node " to avoid double prefixing
                  if (nodeInfo.user.longName.isEmpty()) {
-                     nodeInfo.user.longName = String(nodeInfo.nodeId, HEX);
+                     nodeInfo.user.longName = formatMeshCoreNodeId(nodeInfo.nodeId);
                  }
-                 nodeInfo.user.shortName = nodeInfo.user.longName.substring(0, 4);
+                 // MeshCore expects full 8-char IDs for display; keep both names aligned
+                 nodeInfo.user.shortName = formatMeshCoreNodeId(nodeInfo.nodeId);
                  nodeInfo.user.id = String(nodeInfo.nodeId);
                  
                  // Extract other fields
@@ -1476,13 +1487,7 @@ void MeshtasticClient::handleMeshCoreContactMessage(uint8_t code, const uint8_t 
 
     const MeshtasticNode *node = findNodeByPubKeyPrefix(prefix, 6);
     uint32_t fromId = node ? node->nodeId : deriveNodeIdFromPrefix(prefix, 6);
-    String fromName;
-    if (node) {
-        fromName = node->longName.length() ? node->longName : node->shortName;
-    }
-    if (fromName.isEmpty()) {
-        fromName = generateNodeDisplayName(fromId);
-    }
+    String fromName = formatMeshCoreNodeId(fromId);
 
     MeshtasticMessage msg;
     msg.fromNodeId = fromId;
@@ -1503,8 +1508,11 @@ void MeshtasticClient::handleMeshCoreContactMessage(uint8_t code, const uint8_t 
     addMessageToHistory(msg);
     LOG_PRINTF("[MeshCore] Contact msg from %s (0x%08X) len=%d direct=%d\n",
                msg.fromName.c_str(), msg.fromNodeId, text.length(), msg.isDirect);
-    if (g_ui && g_ui->currentTab != 0) {
-        g_ui->showMessage("DM from " + msg.fromName);
+    if (g_notificationManager) {
+        g_notificationManager->playNotification(false); // direct message ringtone
+    }
+    if (g_ui) {
+        g_ui->openNewMessagePopup(msg.fromName, text, msg.snr);
     }
 }
 
@@ -1579,9 +1587,12 @@ void MeshtasticClient::handleMeshCoreChannelMessage(uint8_t code, const uint8_t 
 
     addMessageToHistory(msg);
     LOG_PRINTF("[MeshCore] Channel msg (ch=%d) len=%d\n", channelIdx, text.length());
-    if (g_ui && g_ui->currentTab != 0) {
+    if (g_notificationManager) {
+        g_notificationManager->playNotification(true); // broadcast/channel ringtone
+    }
+    if (g_ui) {
         int previewLen = std::min<int>(text.length(), 30);
-        g_ui->showMessage(channelName + ": " + text.substring(0, previewLen));
+        g_ui->openNewMessagePopup(channelName, text.substring(0, previewLen), msg.snr);
     }
 }
 
@@ -2547,8 +2558,11 @@ bool MeshtasticClient::sendDirectMessage(uint32_t nodeId, const String &message)
                 MeshtasticMessage msg;
                 msg.fromNodeId = myNodeId;
                 msg.toNodeId = nodeId;
-                msg.fromName = myNodeName.length() ? myNodeName : generateNodeDisplayName(myNodeId);
-                msg.toName = node.longName.length() ? node.longName : (node.shortName.length() ? node.shortName : generateNodeDisplayName(nodeId));
+                msg.fromName = myNodeName.length() ? myNodeName :
+                               (deviceType == DEVICE_MESHCORE ? formatMeshCoreNodeId(myNodeId)
+                                                                : generateNodeDisplayName(myNodeId));
+                msg.toName = node.longName.length() ? node.longName : (node.shortName.length() ? node.shortName :
+                               (deviceType == DEVICE_MESHCORE ? formatMeshCoreNodeId(nodeId) : generateNodeDisplayName(nodeId)));
                 msg.content = message;
                 msg.timestamp = millis() / 1000;
                 msg.messageType = MSG_TYPE_TEXT;
@@ -2937,7 +2951,9 @@ bool MeshtasticClient::broadcastMessage(const String& message, uint8_t channel) 
             MeshtasticMessage msg;
             msg.fromNodeId = myNodeId;
             msg.toNodeId = 0xFFFFFFFF;
-            msg.fromName = myNodeName.length() ? myNodeName : generateNodeDisplayName(myNodeId);
+            msg.fromName = myNodeName.length() ? myNodeName :
+                           (deviceType == DEVICE_MESHCORE ? formatMeshCoreNodeId(myNodeId)
+                                                            : generateNodeDisplayName(myNodeId));
             String channelName = getPrimaryChannelName();
             if (channelName.isEmpty()) channelName = "Primary";
             msg.toName = channelName;
@@ -2956,6 +2972,13 @@ bool MeshtasticClient::broadcastMessage(const String& message, uint8_t channel) 
 }
 
 bool MeshtasticClient::sendTraceRoute(uint32_t destId, uint8_t hopLimit) {
+    (void)destId;
+    (void)hopLimit;
+    if (deviceType == DEVICE_MESHCORE) {
+        LOG_PRINTLN("[TraceRoute] MeshCore does not support trace route requests");
+        if (g_ui) g_ui->showError("Trace Route not supported on MeshCore");
+        return false;
+    }
     // Send traceroute packet
     return false;
 }

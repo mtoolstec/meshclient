@@ -1,10 +1,9 @@
 #include "notification.h"
+#include "hardware_config.h"
 #include <Preferences.h>
 #include <cmath>
 
-#ifdef CARDPUTER_ADV
 #include <M5Cardputer.h>
-#endif
 
 NotificationManager* g_notificationManager = nullptr;
 
@@ -18,15 +17,13 @@ NotificationManager::~NotificationManager() {
 void NotificationManager::begin() {
     loadSettings();
     
-#ifdef CARDPUTER_ADV
-    // CardPuter ADV has built-in speaker, use M5Cardputer.Speaker API
-    Serial.println("[Notification] CardPuter ADV - Using M5Cardputer.Speaker");
-    speakerAvailable = true;
-#else
-    // Standard CardPuter doesn't have speaker hardware
-    Serial.println("[Notification] Standard CardPuter - No speaker hardware");
-    speakerAvailable = false;
-#endif
+    if (isCardputerAdv()) {
+        Serial.println("[Notification] CardPuter ADV - Using M5Cardputer.Speaker");
+        speakerAvailable = true;
+    } else {
+        Serial.println("[Notification] Standard CardPuter - No speaker hardware");
+        speakerAvailable = false;
+    }
     
     Serial.println("[Notification] Manager initialized");
 }
@@ -68,17 +65,12 @@ void NotificationManager::playRingtone(RingtoneType type) {
 }
 
 void NotificationManager::playBeep() {
-#ifdef CARDPUTER_ADV
     Serial.println("[Notification] Playing BEEP using M5Cardputer.Speaker");
     // Simple beep: 1000Hz for 200ms
     M5Cardputer.Speaker.tone(1000, 200);
-#else
-    Serial.println("[Notification] Cannot play BEEP - no speaker on standard CardPuter");
-#endif
 }
 
 void NotificationManager::playBell() {
-#ifdef CARDPUTER_ADV
     Serial.println("[Notification] Playing BELL using M5Cardputer.Speaker");
     // Bell-like tone: sequence of frequencies
     M5Cardputer.Speaker.tone(800, 100);
@@ -86,13 +78,9 @@ void NotificationManager::playBell() {
     M5Cardputer.Speaker.tone(1000, 100);
     delay(50);
     M5Cardputer.Speaker.tone(1200, 150);
-#else
-    Serial.println("[Notification] Cannot play BELL - no speaker on standard CardPuter");
-#endif
 }
 
 void NotificationManager::playChime() {
-#ifdef CARDPUTER_ADV
     Serial.println("[Notification] Playing CHIME using M5Cardputer.Speaker");
     // Gentle chime: ascending tones
     M5Cardputer.Speaker.tone(523, 100);  // C5
@@ -100,9 +88,6 @@ void NotificationManager::playChime() {
     M5Cardputer.Speaker.tone(659, 100);  // E5
     delay(50);
     M5Cardputer.Speaker.tone(784, 150);  // G5
-#else
-    Serial.println("[Notification] Cannot play CHIME - no speaker on standard CardPuter");
-#endif
 }
 
 void NotificationManager::playNotification(bool isBroadcast) {
@@ -120,9 +105,10 @@ void NotificationManager::playNotification(bool isBroadcast) {
 }
 
 void NotificationManager::stopRingtone() {
-#ifdef CARDPUTER_ADV
+    if (!speakerAvailable) {
+        return;
+    }
     M5Cardputer.Speaker.stop();
-#endif
 }
 
 void NotificationManager::loadSettings() {

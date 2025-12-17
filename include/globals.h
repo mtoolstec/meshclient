@@ -8,11 +8,8 @@
 // #include <M5Cardputer.h> // Temporarily disabled, using simplified GPIO direct reading
 // #include <Keyboard.h>   // Temporarily disabled custom keyboard library
 #include <Keyboard.h>  // Custom Keyboard class from Bruce project
+#include "hardware_config.h"
 #include <NimBLEDevice.h>
-
-// Display configuration
-#define DISPLAY_WIDTH 320
-#define DISPLAY_HEIGHT 240
 
 // Meshtastic UART 配置
 #ifndef MESHTASTIC_UART_BAUD

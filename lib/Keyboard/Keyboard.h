@@ -13,11 +13,10 @@
 #include <iostream>
 #include <vector>
 #include "Arduino.h"
+#include "hardware_config.h"
 
-#ifdef CARDPUTER_ADV
 // M5Cardputer library includes Adafruit_TCA8418
 #include <utility/Adafruit_TCA8418/Adafruit_TCA8418.h>
-#endif
 
 struct Chart_t
 {
@@ -32,8 +31,8 @@ struct Point2D_t
     uint8_t y;
 };
 
-const std::vector<int> output_list = {8, 9, 11};
-const std::vector<int> input_list = {13, 15, 3, 4, 5, 6, 7};
+const std::vector<int> output_list = {KB_OUTPUT_PINS[0], KB_OUTPUT_PINS[1], KB_OUTPUT_PINS[2]};
+const std::vector<int> input_list = {KB_INPUT_PINS[0], KB_INPUT_PINS[1], KB_INPUT_PINS[2], KB_INPUT_PINS[3], KB_INPUT_PINS[4], KB_INPUT_PINS[5], KB_INPUT_PINS[6]};
 
 const Chart_t X_map_chart[7] = {{1, 0, 1}, {2, 2, 3}, {4, 4, 5}, {8, 6, 7}, {16, 8, 9}, {32, 10, 11}, {64, 12, 13}};
 
@@ -135,19 +134,15 @@ private:
     KeysState _keys_state_buffer;
     bool _is_caps_locked;
     uint8_t _last_key_size;
+    bool _useTCA;
 
-#ifdef CARDPUTER_ADV
     Adafruit_TCA8418 _tca;
     void _updateKeyListTCA();
-#else
     void _set_output(const std::vector<int> &pinList, uint8_t output);
     uint8_t _get_input(const std::vector<int> &pinList);
-#endif
 
 public:
-    Keyboard_Class() : _is_caps_locked(false)
-    {
-    }
+    Keyboard_Class() : _is_caps_locked(false), _last_key_size(0), _useTCA(false) {}
 
     void begin();
     uint8_t getKey(Point2D_t keyCoor);

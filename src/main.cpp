@@ -2,7 +2,9 @@
 #include "meshtastic_client.h"
 #include "ui.h"
 #include "notification.h"
+#include "hardware_config.h"
 #include <M5Cardputer.h>
+#include <Wire.h>
 
 // Define global variables
 bool deviceConnected = false;
@@ -15,13 +17,59 @@ MeshtasticUI *ui = nullptr;
 MeshtasticClient *client = nullptr;
 NotificationManager *notificationManager = nullptr;
 
+namespace {
+bool probeI2CDeviceOnPins(int sda, int scl, uint8_t addr) {
+    Wire.begin(sda, scl);
+    delay(2);
+    Wire.beginTransmission(addr);
+    return Wire.endTransmission() == 0;
+}
+
+bool detectAdvPreInit() {
+    // CardPuter ADV uses internal I2C on SDA=8, SCL=9 for TCA8418 / IMU / codec.
+    // We probe a few known addresses to select the correct M5Unified fallback board.
+    if (probeI2CDeviceOnPins(8, 9, 0x34) || probeI2CDeviceOnPins(8, 9, 0x35)) return true; // TCA8418
+    if (probeI2CDeviceOnPins(8, 9, 0x68)) return true; // BMI270 (common)
+    if (probeI2CDeviceOnPins(8, 9, 0x18)) return true; // ES8311
+
+    // Some setups may route I2C peripherals to the external Port.A bus.
+    if (probeI2CDeviceOnPins(2, 1, 0x34) || probeI2CDeviceOnPins(2, 1, 0x35)) return true;
+    if (probeI2CDeviceOnPins(2, 1, 0x68)) return true;
+    if (probeI2CDeviceOnPins(2, 1, 0x18)) return true;
+
+    return false;
+}
+} // namespace
+
 void setup() {
     Serial.begin(115200);
     Serial.println("Step 1: Basic serial OK");
 
     Serial.println("Step 2: Initializing Cardputer...");
-    M5Cardputer.begin(true);
+    const bool advDetected = detectAdvPreInit();
+    auto cfg = M5.config();
+    cfg.fallback_board = advDetected ? m5::board_t::board_M5CardputerADV : m5::board_t::board_M5Cardputer;
+    Serial.printf("Step 2.1: Pre-init detect: %s (fallback_board=%s)\n",
+                  advDetected ? "ADV" : "Base",
+                  advDetected ? "board_M5CardputerADV" : "board_M5Cardputer");
+    M5Cardputer.begin(cfg, true);
     Serial.println("Step 3: Cardputer initialized");
+
+    // Autodetect hardware variant (ADV vs standard) and log details
+    printHardwareInfo();
+
+    // Standard CardPuter uses GPIO matrix keys; preconfigure pins to silence driver warnings
+    if (!isCardputerAdv()) {
+        const int outputs[] = {8, 9, 11};
+        const int inputs[] = {13, 15, 3, 4, 5, 6, 7};
+        for (int pin : outputs) {
+            pinMode(pin, OUTPUT);
+            digitalWrite(pin, LOW);
+        }
+        for (int pin : inputs) {
+            pinMode(pin, INPUT_PULLUP);
+        }
+    }
 
     // Ensure OK button (GPIO0) has a defined state for digitalRead in UI
     pinMode(0, INPUT_PULLUP);

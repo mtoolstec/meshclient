@@ -1,0 +1,17 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build cardputer",
+			"type": "shell",
+			"command": "pio",
+			"args": [
+				"run",
+				"-e",
+				"cardputer"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}

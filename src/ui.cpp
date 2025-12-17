@@ -1,7 +1,9 @@
 #include "ui.h"
 #include "meshtastic_client.h"
 #include "notification.h"
+#include "hardware_config.h"
 #include <algorithm>
+#include <cstdio>
 #include <cctype>
 #include <set>
 
@@ -270,10 +272,27 @@ void MeshtasticUI::handleInput() {
 	bool newTabKey = keyState.tab && !prevTab;
 
 	// Arrow detection: fire on new press; also support key repeat while held
+	// Arrow detection: prefer HID codes; on standard CardPuter the physical up/down emit ';' and '.'
 	bool arrowUp = hasHid(0x52);
 	bool arrowDown = hasHid(0x51);
 	bool arrowLeft = hasHid(0x50);
 	bool arrowRight = hasHid(0x4F);
+
+	// Track punctuation-as-arrows on standard CardPuter with edge + repeat behavior
+	bool charArrowHeldUp = false, charArrowHeldDown = false;
+	bool charArrowNewUp = false, charArrowNewDown = false;
+	if (!isCardputerAdv()) {
+		auto hasChar = [&](const std::vector<char> &vec, char c) {
+			return std::find(vec.begin(), vec.end(), c) != vec.end();
+		};
+		charArrowHeldUp = hasChar(currentWord, ';');
+		charArrowHeldDown = hasChar(currentWord, '.');
+		charArrowNewUp = charArrowHeldUp && !hasChar(prevWord, ';');
+		charArrowNewDown = charArrowHeldDown && !hasChar(prevWord, '.');
+
+		if (charArrowNewUp) arrowUp = true;
+		if (charArrowNewDown) arrowDown = true;
+	}
 
 	// Key repeat for held arrows - optimized for better responsiveness
 	static uint32_t lastRepeatUp = 0, lastRepeatDown = 0, lastRepeatLeft = 0, lastRepeatRight = 0;
@@ -285,20 +304,45 @@ void MeshtasticUI::handleInput() {
 	auto hidHeld = [&](uint8_t code) {
 		return std::find(currentHid.begin(), currentHid.end(), code) != currentHid.end();
 	};
+
+	auto arrowHeldUp = hidHeld(0x52);
+	auto arrowHeldDown = hidHeld(0x51);
 	
 	uint32_t arrowNowMs = millis();
+
+	// Debounce punctuation-based arrows on standard CardPuter to avoid rapid bursts
+	if (!isCardputerAdv()) {
+		static uint32_t lastCharArrowUp = 0;
+		static uint32_t lastCharArrowDown = 0;
+		const uint32_t debounceMs = 140; // minimal gap between firings
+
+		if (arrowUp && charArrowHeldUp) {
+			if (arrowNowMs - lastCharArrowUp < debounceMs) {
+				arrowUp = false; // suppress if too soon
+			} else {
+				lastCharArrowUp = arrowNowMs;
+			}
+		}
+		if (arrowDown && charArrowHeldDown) {
+			if (arrowNowMs - lastCharArrowDown < debounceMs) {
+				arrowDown = false;
+			} else {
+				lastCharArrowDown = arrowNowMs;
+			}
+		}
+	}
 	
 	// Track when arrow keys are first pressed
-	if (arrowUp && !hidHeld(0x52)) arrowPressTimeUp = arrowNowMs;
-	if (arrowDown && !hidHeld(0x51)) arrowPressTimeDown = arrowNowMs;
+	if (arrowUp && !arrowHeldUp) arrowPressTimeUp = arrowNowMs;
+	if (arrowDown && !arrowHeldDown) arrowPressTimeDown = arrowNowMs;
 	if (arrowLeft && !hidHeld(0x50)) arrowPressTimeLeft = arrowNowMs;
 	if (arrowRight && !hidHeld(0x4F)) arrowPressTimeRight = arrowNowMs;
 	
 	// Handle repeat for held arrows with initial delay
-	if (!arrowUp && hidHeld(0x52) && arrowNowMs - arrowPressTimeUp > initialArrowDelay && arrowNowMs - lastRepeatUp >= repeatEveryMs) { 
+	if (!arrowUp && arrowHeldUp && arrowNowMs - arrowPressTimeUp > initialArrowDelay && arrowNowMs - lastRepeatUp >= repeatEveryMs) { 
 		arrowUp = true; lastRepeatUp = arrowNowMs; 
 	}
-	if (!arrowDown && hidHeld(0x51) && arrowNowMs - arrowPressTimeDown > initialArrowDelay && arrowNowMs - lastRepeatDown >= repeatEveryMs) { 
+	if (!arrowDown && arrowHeldDown && arrowNowMs - arrowPressTimeDown > initialArrowDelay && arrowNowMs - lastRepeatDown >= repeatEveryMs) { 
 		arrowDown = true; lastRepeatDown = arrowNowMs; 
 	}
 	if (!arrowLeft && hidHeld(0x50) && arrowNowMs - arrowPressTimeLeft > initialArrowDelay && arrowNowMs - lastRepeatLeft >= repeatEveryMs) { 
@@ -1166,6 +1210,19 @@ void MeshtasticUI::showNodesTab() {
 	
 	// Cache node list for better performance
 	const auto &nodeList = client->getNodeList();
+	const bool meshCoreIds = client && client->getDeviceType() == DEVICE_MESHCORE;
+	auto formatId = [&](uint32_t id) -> String {
+		char buf[9];
+		uint8_t width = meshCoreIds ? 8 : 4;
+		snprintf(buf, sizeof(buf), "%0*X", width, id);
+		return String(buf);
+	};
+	auto displayIdForNode = [&](const MeshtasticNode* n) -> String {
+		if (meshCoreIds && n && n->macAddress.length() >= 8) {
+			return n->macAddress.substring(0, 8);
+		}
+		return formatId(n ? n->nodeId : 0);
+	};
 	
 	// Calculate the range of nodes to display based on scroll offset
 	int startIndex = nodeScrollOffset;
@@ -1193,8 +1250,7 @@ void MeshtasticUI::showNodesTab() {
 		} else if (!node->longName.isEmpty()) {
 			name = node->longName;
 		} else {
-			String fullHex = String(node->nodeId, HEX);
-			name = fullHex.length() > 4 ? fullHex.substring(fullHex.length() - 4) : fullHex;
+			name = displayIdForNode(node);
 		}
 
 		// Always clear and redraw to avoid ghosting
@@ -1243,8 +1299,7 @@ void MeshtasticUI::showNodesTab() {
 			// Node name (full name)
 			String fullName = selectedNode->longName.length() ? selectedNode->longName : selectedNode->shortName;
 			if (fullName.isEmpty()) {
-				String fullHex = String(selectedNode->nodeId, HEX);
-				fullName = (fullHex.length() > 4 ? fullHex.substring(fullHex.length() - 4) : fullHex);
+				fullName = displayIdForNode(selectedNode);
 			}
 			drawText("Name:", rightColumnX, detailY);
 			drawText(fullName, rightColumnX, detailY + 12);
@@ -1252,7 +1307,7 @@ void MeshtasticUI::showNodesTab() {
 			
 			// Node ID
 			drawText("ID:", rightColumnX, detailY);
-			drawText(String(selectedNode->nodeId, HEX), rightColumnX, detailY + 12);
+			drawText(displayIdForNode(selectedNode), rightColumnX, detailY + 12);
 			detailY += 30;
 			
 			// Last heard
@@ -2184,7 +2239,10 @@ void MeshtasticUI::openNodeActionMenu() {
 		modalItems.push_back("Ping Repeater");
 	}
 
-	modalItems.push_back("Trace Route");
+	// Trace Route only supported on Meshtastic devices
+	if (!client || client->getDeviceType() != DEVICE_MESHCORE) {
+		modalItems.push_back("Trace Route");
+	}
 	modalItems.push_back("Add to Favorite");
 	modalItems.push_back("Delete");
 	modalItems.push_back("Close");
@@ -2751,8 +2809,12 @@ void MeshtasticUI::handleModalSelection() {
 				client->sendMeshCorePing(nodeId);
 				showMessage("Ping sent to " + String(nodeId, HEX));
 			} else if (choice == "Trace Route") {
-				client->sendTraceRoute(nodeId, 5); // Default hop limit of 5
-				showMessage("Trace route sent");
+				if (client->getDeviceType() == DEVICE_MESHCORE) {
+					showError("Trace Route not supported on MeshCore");
+				} else {
+					client->sendTraceRoute(nodeId, 5); // Default hop limit of 5
+					showMessage("Trace route sent");
+				}
 			} else if (choice == "Add to Favorite") {
 				// TODO: Implement favorites functionality
 				showMessage("Added to favorites");
@@ -2943,8 +3005,12 @@ void MeshtasticUI::handleModalSelection() {
 				}
 			} else if (choice == "Trace Route") {
 				if (!modalNodeIds.empty()) {
-					client->sendTraceRoute(modalNodeIds[0], 5); // Default hop limit of 5
-					showMessage("Trace route sent");
+					if (client->getDeviceType() == DEVICE_MESHCORE) {
+						showError("Trace Route not supported on MeshCore");
+					} else {
+						client->sendTraceRoute(modalNodeIds[0], 5); // Default hop limit of 5
+						showMessage("Trace route sent");
+					}
 				}
 			} else if (choice == "Remove") {
 				if (!modalNodeIds.empty()) {
@@ -3841,9 +3907,22 @@ void MeshtasticUI::openAboutDialog() {
 }
 
 void MeshtasticUI::openNewMessagePopup(const String &fromName, const String &content, float snr) {
+	String popupFrom = fromName;
+	String popupContent = content;
+
+	// Always prefer the latest entry in message history to avoid stale popups
+	if (client) {
+		const auto &all = client->getMessageHistory();
+		if (!all.empty()) {
+			const auto &latest = all.back();
+			popupFrom = latest.fromName;
+			popupContent = latest.content;
+		}
+	}
+
 	// Cache for potential indicator usage
-	lastNewMessageFrom = fromName;
-	lastNewMessageContent = content;
+	lastNewMessageFrom = popupFrom;
+	lastNewMessageContent = popupContent;
 	hasNewMessageNotification = true;
 
 	// Decide whether the message belongs to the currently viewed conversation
@@ -3866,12 +3945,11 @@ void MeshtasticUI::openNewMessagePopup(const String &fromName, const String &con
 	// If we're on the Messages tab and it's the active conversation, just auto-scroll
 	if (currentTab == 0 && isMessageForCurrentConversation) {
 		scrollToLatestMessage();
-		needsRedraw = true; // redraw list only, no popup
-		return;
+		// Still refresh the popup text so the latest content is shown instead of the prior message
 	}
 
 	// Otherwise, show a transient info overlay (centered message)
-	String popupMessage = fromName + ": " + content;
+	String popupMessage = popupFrom + ": " + popupContent;
 	displayInfo(popupMessage);
 	needsRedraw = true;
 }
@@ -3904,7 +3982,9 @@ void MeshtasticUI::openNodesMenu() {
 		// Don't allow sending messages to self
 		if (!isMyNode) {
 			modalItems.push_back("Send Message");
-			modalItems.push_back("Trace Route");
+			if (client->getDeviceType() != DEVICE_MESHCORE) {
+				modalItems.push_back("Trace Route");
+			}
 			modalItems.push_back("Remove");
 		}
 		modalItems.push_back("Refresh");
@@ -4278,6 +4358,19 @@ void MeshtasticUI::updateMessageDestinations() {
 void MeshtasticUI::showDestinationList() {
 	int y = HEADER_HEIGHT + 6;
 	M5.Lcd.setTextColor(WHITE);
+	const bool meshCoreIds = client && client->getDeviceType() == DEVICE_MESHCORE;
+	auto formatId = [&](uint32_t id) -> String {
+		char buf[9];
+		uint8_t width = meshCoreIds ? 8 : 4;
+		snprintf(buf, sizeof(buf), "%0*X", width, id);
+		return String(buf);
+	};
+	auto displayIdForNode = [&](const MeshtasticNode* n) -> String {
+		if (meshCoreIds && n && n->macAddress.length() >= 8) {
+			return n->macAddress.substring(0, 8);
+		}
+		return formatId(n ? n->nodeId : 0);
+	};
 	
 	// Header
 	M5.Lcd.fillRect(BORDER_PAD - 2, y - 2, M5.Lcd.width() - BORDER_PAD * 2, 18, DARKGREY);
@@ -4303,8 +4396,7 @@ void MeshtasticUI::showDestinationList() {
 					destName = fullHex.length() > 4 ? fullHex.substring(fullHex.length() - 4) : fullHex;
 				}
 			} else {
-				String fullHex = String(nodeId, HEX);
-				destName = fullHex.length() > 4 ? fullHex.substring(fullHex.length() - 4) : fullHex;
+				destName = displayIdForNode(node);
 			}
 		}
 		
@@ -4343,6 +4435,13 @@ void MeshtasticUI::showMessagesForDestination() {
 	
 	// Get filtered messages for current destination
 	auto filteredMessages = getFilteredMessages();
+	const bool useMeshCoreIds = client && client->getDeviceType() == DEVICE_MESHCORE;
+	auto formatId = [&](uint32_t nodeId) -> String {
+		char buf[9];
+		uint8_t width = useMeshCoreIds ? 8 : 4;
+		snprintf(buf, sizeof(buf), "%0*X", width, nodeId);
+		return String(buf);
+	};
 	
 	if (filteredMessages.empty()) {
 		// Show instruction when no messages for current destination
@@ -4391,7 +4490,11 @@ void MeshtasticUI::showMessagesForDestination() {
 	std::vector<String> lineTexts(filteredMessages.size());
 	for (size_t i = 0; i < filteredMessages.size(); ++i) {
 		const auto &msg = filteredMessages[i];
-		String text = msg.fromName + ": " + msg.content;
+		String senderLabel = msg.fromName;
+		if (msg.fromNodeId != 0xFFFFFFFF) {
+			senderLabel = formatId(msg.fromNodeId);
+		}
+		String text = senderLabel + ": " + msg.content;
 		// Truncate to one line with ellipsis based on char estimate
 		if ((int)text.length() > maxCharsPerLine) {
 			messageTruncated[i] = true;
@@ -4488,6 +4591,19 @@ void MeshtasticUI::selectDestination(int index) {
 	
 	// Reset message selection when switching destinations
 	messageSelectedIndex = 0;
+	const bool meshCoreIds = client && client->getDeviceType() == DEVICE_MESHCORE;
+	auto formatId = [&](uint32_t id) -> String {
+		char buf[9];
+		uint8_t width = meshCoreIds ? 8 : 4;
+		snprintf(buf, sizeof(buf), "%0*X", width, id);
+		return String(buf);
+	};
+	auto displayIdForNode = [&](const MeshtasticNode* n) -> String {
+		if (meshCoreIds && n && n->macAddress.length() >= 8) {
+			return n->macAddress.substring(0, 8);
+		}
+		return formatId(n ? n->nodeId : 0);
+	};
 	
 	if (currentDestinationId == 0xFFFFFFFF) {
 		String channelName = client ? client->getPrimaryChannelName() : "Primary";
@@ -4498,12 +4614,10 @@ void MeshtasticUI::selectDestination(int index) {
 		if (node) {
 			currentDestinationName = node->longName.length() ? node->longName : node->shortName;
 			if (currentDestinationName.isEmpty()) {
-				String fullHex = String(currentDestinationId, HEX);
-				currentDestinationName = fullHex.length() > 4 ? fullHex.substring(fullHex.length() - 4) : fullHex;
+				currentDestinationName = displayIdForNode(node);
 			}
 		} else {
-			String fullHex = String(currentDestinationId, HEX);
-			currentDestinationName = fullHex.length() > 4 ? fullHex.substring(fullHex.length() - 4) : fullHex;
+			currentDestinationName = displayIdForNode(nullptr);
 		}
 	}
 }
